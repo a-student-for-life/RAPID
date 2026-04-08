@@ -1,6 +1,6 @@
 """
 Gemini Router
-Sends a structured prompt to Gemini 1.5 Flash (via Vertex AI) and parses the
+Sends a structured prompt to Gemini 2.0 Flash (via Vertex AI) and parses the
 JSON routing response.
 
 The Vertex AI SDK is synchronous, so the blocking call is offloaded to a
@@ -30,14 +30,10 @@ from vertexai.generative_models import GenerationConfig, GenerativeModel
 logger = logging.getLogger(__name__)
 
 # ── Vertex AI initialisation ───────────────────────────────────────────────────
-# Credentials are picked up automatically from:
-#   GOOGLE_APPLICATION_CREDENTIALS env var  (local dev)
-#   Attached service account               (Cloud Run)
 _PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 _LOCATION = "asia-south1"
 
-
-_MODEL = None 
+_MODEL = None
 
 _SYSTEM_PROMPT = """
 You are RAPID, an AI emergency medical routing coordinator.
@@ -45,10 +41,12 @@ Route mass casualty patients to hospitals based on the scored data provided.
 
 ROUTING PRIORITIES (strict order):
 1. TRAUMA CAPABILITY  — for critical patients, prefer trauma centres.
-2. CAPACITY           — do not assign critical patients to a hospital with no ICU beds.
-3. BLOOD READINESS    — prefer hospitals with O-negative units available.
-4. LOAD BALANCE       — distribute patients; avoid overloading a single hospital.
-5. ETA                — all else equal, shorter travel time is better.
+2. SPECIALTY MATCH    — if injury_type is given (burns, neuro, cardiac, ortho),
+                        strongly prefer hospitals whose specialties list includes it.
+3. CAPACITY           — do not assign critical patients to a hospital with no ICU beds.
+4. BLOOD READINESS    — prefer hospitals with O-negative units available.
+5. LOAD BALANCE       — distribute patients; avoid overloading a single hospital.
+6. ETA                — all else equal, shorter travel time is better.
 
 OUTPUT — strict JSON only, no preamble, no markdown:
 {
@@ -58,30 +56,34 @@ OUTPUT — strict JSON only, no preamble, no markdown:
       "hospital":          "<exact name from context>",
       "patients_assigned": <integer>,
       "severity":          "<critical|moderate|minor>",
-      "reason":            "<1-2 sentences citing scores and data>"
+      "injury_type":       "<injury_type if given, else null>",
+      "reason":            "<1-2 sentences citing scores and specialty match>"
     }
   ],
   "reasoning": "<2-3 sentence overall summary>",
   "warnings":  ["<any critical gaps or concerns>"]
 }
 """
+
+
 def _get_model():
     global _MODEL
-    
+
     if _MODEL is not None:
         return _MODEL
-    
+
     if not _PROJECT:
         raise ValueError("GOOGLE_CLOUD_PROJECT not set")
-    
+
     vertexai.init(project=_PROJECT, location=_LOCATION)
 
     _MODEL = GenerativeModel(
-        "gemini-1.5-flash-001",
-        system_instruction=_SYSTEM_PROMPT
+        "gemini-2.0-flash",
+        system_instruction=_SYSTEM_PROMPT,
     )
-
+    logger.info("Gemini 2.0 Flash model initialised.")
     return _MODEL
+
 
 _GEN_CONFIG = GenerationConfig(
     temperature=0.1,
@@ -102,7 +104,7 @@ async def route_patients(
 
     prompt = _build_prompt(scores, patient_groups, hospital_data)
 
-    loop = asyncio.get_running_loop()   # ✅ FIXED
+    loop = asyncio.get_running_loop()
     call = partial(_call_gemini_sync, prompt)
 
     raw = await asyncio.wait_for(
@@ -111,10 +113,8 @@ async def route_patients(
     )
 
     cleaned = re.sub(r"```.*?\n|```", "", raw, flags=re.DOTALL).strip()
-
     result = json.loads(cleaned)
 
-    # ✅ Validation
     if not isinstance(result, dict):
         raise ValueError("Invalid AI response (not dict)")
 
@@ -122,7 +122,6 @@ async def route_patients(
         raise ValueError("Invalid AI response (missing assignments)")
 
     result["decision_path"] = "AI"
-
     return result
 
 
@@ -135,7 +134,11 @@ def _build_prompt(
 ) -> str:
     total = sum(pg["count"] for pg in patient_groups)
     patient_lines = "\n".join(
-        f"  - {pg['count']} {pg['severity']} patient(s)"
+        "  - {count} {severity} patient(s){injury}".format(
+            count=pg["count"],
+            severity=pg["severity"],
+            injury=f" [injury_type: {pg['injury_type']}]" if pg.get("injury_type") else "",
+        )
         for pg in patient_groups
     )
 
@@ -168,19 +171,13 @@ def _build_prompt(
         f"PATIENTS (total: {total}):\n{patient_lines}\n\n"
         f"HOSPITALS ({len(hospital_data)}, ranked by composite score):\n{hospital_lines}\n"
         f"Assign all {total} patients. Verify assignments sum to {total}. "
-        f"Justify every decision. Use scores as context."
+        f"Justify every decision. Use scores and specialty matches as context."
     )
 
 
 # ── Synchronous Vertex AI call (runs in thread executor) ──────────────────────
 
 def _call_gemini_sync(prompt: str) -> str:
-
-    model = _get_model()   # ✅ IMPORTANT FIX
-
-    response = model.generate_content(
-        prompt,
-        generation_config=_GEN_CONFIG
-    )
-
+    model = _get_model()
+    response = model.generate_content(prompt, generation_config=_GEN_CONFIG)
     return response.text.strip()

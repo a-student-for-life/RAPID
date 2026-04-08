@@ -2,25 +2,28 @@
 Location Engine — Dynamic Hospital Discovery
 Discovers nearby hospitals from OpenStreetMap via the Overpass API.
 Expands search radius automatically until a minimum number of results is found.
+
+Cache uses cachetools.TTLCache so it is safe when Cloud Run scales to multiple
+instances (each instance has its own in-process cache with a 1-hour TTL).
 """
 
 import math
-import time
 import httpx
+from cachetools import TTLCache
 from typing import Any
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
-_cache: dict[str, dict] = {}
-_CACHE_TTL = 3600  # seconds
+# maxsize=256 entries, each keyed by (lat, lon, radius) rounded to 2 dp.
+_cache: TTLCache = TTLCache(maxsize=256, ttl=3600)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URL     = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 18  # seconds
 RADIUS_STEP_FACTOR = 1.6
-MIN_HOSPITALS = 3
-INITIAL_RADIUS_KM = 15.0
-MAX_RADIUS_KM = 30.0
-MAX_RESULTS = 10
+MIN_HOSPITALS      = 3
+INITIAL_RADIUS_KM  = 15.0
+MAX_RADIUS_KM      = 30.0
+MAX_RESULTS        = 10
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -73,11 +76,12 @@ async def _fetch_and_cache(lat: float, lon: float, radius_km: float) -> list[dic
     """Return cached result if fresh, otherwise query Overpass and cache."""
     key = f"{round(lat, 2)}_{round(lon, 2)}_{radius_km}"
 
-    if key in _cache and time.time() - _cache[key]["ts"] < _CACHE_TTL:
-        return _cache[key]["data"]
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
 
     hospitals = await _query_overpass(lat, lon, radius_km)
-    _cache[key] = {"data": hospitals, "ts": time.time()}
+    _cache[key] = hospitals
     return hospitals
 
 
