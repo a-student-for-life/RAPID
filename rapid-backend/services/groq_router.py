@@ -1,17 +1,16 @@
 """
-Gemini Router
-Calls the Gemini API (AI Studio) via httpx and parses the JSON routing response.
+Groq Router
+Calls the Groq API (OpenAI-compatible) for patient routing when Gemini is
+unavailable. Uses llama-3.3-70b-versatile — fast, free tier, JSON mode.
 
-Requires only a GEMINI_API_KEY in the environment — no Google Cloud project
-or Vertex AI credentials needed.
+Acts as the second-tier AI fallback in the routing chain:
+  Gemini → Groq → deterministic fallback_router
 
-Output schema is identical to fallback_router so the incident endpoint can
-swap between them without any structural changes.
+Output schema is identical to gemini_router and fallback_router.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -23,11 +22,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
-_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_API_KEY  = os.getenv("GROQ_API_KEY", "")
+_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+_URL      = "https://api.groq.com/openai/v1/chat/completions"
 
-_AI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15.0"))
+_AI_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "15.0"))
 
 _SYSTEM_PROMPT = """
 You are RAPID, an AI emergency medical routing coordinator.
@@ -68,74 +67,57 @@ async def route_patients(
     hospital_data: dict[str, dict],
 ) -> dict[str, Any]:
     """
-    Call Gemini API and return patient routing decisions.
-    Raises ValueError if GEMINI_API_KEY is not set.
+    Call Groq API and return patient routing decisions.
+    Raises ValueError if GROQ_API_KEY is not set.
     Raises on HTTP or JSON errors — caller falls back to fallback_router.
     """
     if not _API_KEY:
-        raise ValueError("GEMINI_API_KEY not set — AI routing disabled")
+        raise ValueError("GROQ_API_KEY not set")
 
     prompt = _build_prompt(scores, patient_groups, hospital_data)
 
     request_body = {
-        "system_instruction": {
-            "parts": [{"text": _SYSTEM_PROMPT.strip()}]
-        },
-        "contents": [
-            {"parts": [{"text": prompt}]}
+        "model":    _MODEL,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT.strip()},
+            {"role": "user",   "content": prompt},
         ],
-        "generationConfig": {
-            "temperature":      0.1,
-            "maxOutputTokens":  2048,
-            "responseMimeType": "application/json",
-        },
+        "temperature":     0.1,
+        "max_tokens":      2048,
+        "response_format": {"type": "json_object"},
     }
 
-    url = f"{_BASE_URL}/{_MODEL}:generateContent"
+    async with httpx.AsyncClient(timeout=_AI_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            _URL,
+            headers={"Authorization": f"Bearer {_API_KEY}"},
+            json=request_body,
+        )
 
-    # Retry up to 2 times on 429 (free-tier rate limit), with backoff.
-    max_attempts = 2
-    for attempt in range(1, max_attempts + 1):
-        async with httpx.AsyncClient(timeout=_AI_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                url,
-                params={"key": _API_KEY},
-                json=request_body,
-            )
-
-        if response.status_code != 200:
-            logger.warning("Gemini HTTP %d (attempt %d/%d): %s",
-                           response.status_code, attempt, max_attempts, response.text[:300])
-
-        if response.status_code == 429 and attempt < max_attempts:
-            retry_after = int(response.headers.get("Retry-After", 10))
-            logger.warning("Retrying in %ds.", retry_after)
-            await asyncio.sleep(retry_after)
-            continue
-
-        response.raise_for_status()
-        break
+    if response.status_code != 200:
+        logger.warning("Groq HTTP %d: %s", response.status_code, response.text[:300])
+    response.raise_for_status()
 
     data = response.json()
 
     try:
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as exc:
-        raise ValueError(f"Unexpected Gemini response shape: {exc}") from exc
+        raise ValueError(f"Unexpected Groq response shape: {exc}") from exc
 
     cleaned = re.sub(r"```.*?\n|```", "", raw, flags=re.DOTALL).strip()
     result  = json.loads(cleaned)
 
     if not isinstance(result, dict):
-        raise ValueError("Invalid AI response (not a dict)")
+        raise ValueError("Invalid Groq response (not a dict)")
     if "assignments" not in result:
-        raise ValueError("Invalid AI response (missing assignments)")
+        raise ValueError("Invalid Groq response (missing assignments)")
 
     result["decision_path"] = "AI"
     return result
 
 
-# ── Prompt builder ─────────────────────────────────────────────────────────────
+# ── Prompt builder (shared logic with gemini_router) ──────────────────────────
 
 def _build_prompt(
     scores: list[dict],
@@ -153,7 +135,6 @@ def _build_prompt(
     )
 
     hospital_lines = ""
-
     for rank, scored in enumerate(scores, start=1):
         name  = scored["name"]
         info  = hospital_data.get(name, {})

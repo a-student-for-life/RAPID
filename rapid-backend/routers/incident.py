@@ -23,7 +23,7 @@ from models.schemas import IncidentRequest, IncidentResponse
 from services.location_engine import discover_hospitals_adaptive
 from services.aggregator import fetch_hospital_data
 from services.scorer import score_all
-from services import gemini_router, fallback_router
+from services import gemini_router, groq_router, fallback_router
 from services import firestore_client
 
 logger = logging.getLogger(__name__)
@@ -125,18 +125,31 @@ async def _route(
     force_fallback: bool = False,
 ) -> dict:
     """
-    Try Gemini first. On any failure (or force_fallback=True), use fallback.
+    Routing chain: Gemini → Groq → deterministic fallback.
+    Each tier is tried in order; any failure moves to the next.
+    force_fallback=True skips both AI tiers.
     """
     if not force_fallback:
+        # ── Tier 1: Gemini ────────────────────────────────────────────────────
         try:
             return await gemini_router.route_patients(scores, patient_groups, hospital_data)
         except asyncio.TimeoutError:
-            logger.warning("Gemini timed out after %.1fs — switching to fallback router.",
-                           gemini_router._AI_TIMEOUT_SECONDS)
+            logger.warning("Gemini timed out — trying Groq.")
         except Exception as exc:
-            logger.warning("Gemini unavailable (%s: %s) — switching to fallback router.",
+            logger.warning("Gemini unavailable (%s: %s) — trying Groq.", type(exc).__name__, exc)
+
+        # ── Tier 2: Groq ──────────────────────────────────────────────────────
+        try:
+            result = await groq_router.route_patients(scores, patient_groups, hospital_data)
+            logger.info("Groq routing succeeded.")
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("Groq timed out — switching to deterministic fallback.")
+        except Exception as exc:
+            logger.warning("Groq unavailable (%s: %s) — switching to deterministic fallback.",
                            type(exc).__name__, exc)
     else:
-        logger.info("force_fallback=True — skipping Gemini.")
+        logger.info("force_fallback=True — skipping AI tiers.")
 
+    # ── Tier 3: deterministic fallback ────────────────────────────────────────
     return fallback_router.route_patients(scores, patient_groups, hospital_data)

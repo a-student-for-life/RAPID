@@ -1,14 +1,14 @@
+from dotenv import load_dotenv
+load_dotenv()  # must run before any other import that calls os.getenv at module level
+
 from contextlib import asynccontextmanager
 import logging
 import os
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers import incident
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,14 +19,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    project = os.getenv("GOOGLE_CLOUD_PROJECT", "")
-    if not project:
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
         logger.warning(
-            "GOOGLE_CLOUD_PROJECT not set — Gemini routing disabled; "
+            "GEMINI_API_KEY not set — Gemini routing disabled; "
             "RAPID will operate in FALLBACK-only mode."
         )
     else:
-        logger.info("RAPID starting with Google Cloud project: %s", project)
+        from services import gemini_router as _gr
+        logger.info("RAPID starting with Gemini API key configured (model: %s).", _gr._MODEL)
     yield
 
 

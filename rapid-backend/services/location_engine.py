@@ -7,10 +7,13 @@ Cache uses cachetools.TTLCache so it is safe when Cloud Run scales to multiple
 instances (each instance has its own in-process cache with a 1-hour TTL).
 """
 
+import logging
 import math
 import httpx
 from cachetools import TTLCache
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
 # maxsize=256 entries, each keyed by (lat, lon, radius) rounded to 2 dp.
@@ -24,6 +27,22 @@ MIN_HOSPITALS      = 3
 INITIAL_RADIUS_KM  = 15.0
 MAX_RADIUS_KM      = 30.0
 MAX_RESULTS        = 10
+
+# Pre-seeded Mumbai hospitals used when Overpass is unavailable or rate-limited.
+# Coordinates are approximate; names match simulator.py _KNOWN_HOSPITALS for
+# rich capacity data.
+_MUMBAI_SEED_HOSPITALS = [
+    {"id": "seed_1", "name": "KEM Hospital",
+     "lat": 18.9990, "lon": 72.8380, "data_source": "seed", "data_quality": "curated"},
+    {"id": "seed_2", "name": "Lokmanya Tilak General Hospital",
+     "lat": 19.0424, "lon": 72.8418, "data_source": "seed", "data_quality": "curated"},
+    {"id": "seed_3", "name": "Rajawadi Hospital",
+     "lat": 19.0866, "lon": 72.8948, "data_source": "seed", "data_quality": "curated"},
+    {"id": "seed_4", "name": "Bhabha Hospital",
+     "lat": 19.0704, "lon": 72.8818, "data_source": "seed", "data_quality": "curated"},
+    {"id": "seed_5", "name": "Kokilaben Dhirubhai Ambani Hospital",
+     "lat": 19.1321, "lon": 72.8210, "data_source": "seed", "data_quality": "curated"},
+]
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -63,6 +82,25 @@ async def discover_hospitals_adaptive(
 
     # Final attempt at max radius
     hospitals = await _fetch_and_cache(lat, lon, max_radius_km)
+
+    # If Overpass returned too few results, fill in with pre-seeded hospitals.
+    if len(hospitals) < min_count:
+        existing_names = {h["name"] for h in hospitals}
+        seeds = [
+            {**h, "distance_km": haversine(lat, lon, h["lat"], h["lon"])}
+            for h in _MUMBAI_SEED_HOSPITALS
+            if h["name"] not in existing_names
+        ]
+        seeds.sort(key=lambda h: h["distance_km"])
+        hospitals = sorted(
+            hospitals + seeds,
+            key=lambda h: h["distance_km"],
+        )[:MAX_RESULTS]
+        logger.warning(
+            "Overpass returned fewer than %d hospitals — merged %d seed hospitals.",
+            min_count, len(seeds),
+        )
+
     return {
         "hospitals": hospitals,
         "radius_km": max_radius_km,
@@ -97,15 +135,20 @@ async def _query_overpass(lat: float, lon: float, radius_km: float) -> list[dict
         f"out center;"
     )
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            OVERPASS_URL,
-            data={"data": query},
-            timeout=OVERPASS_TIMEOUT,
-        )
-        response.raise_for_status()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                OVERPASS_URL,
+                data={"data": query},
+                timeout=OVERPASS_TIMEOUT,
+            )
+            response.raise_for_status()
+        elements = response.json().get("elements", [])
+    except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+        logger.warning("Overpass API unavailable (%s: %s) — returning empty list.", type(exc).__name__, exc)
+        return []
 
-    hospitals = _parse_elements(response.json().get("elements", []), lat, lon)
+    hospitals = _parse_elements(elements, lat, lon)
     hospitals.sort(key=lambda h: h["distance_km"])
     return hospitals[:MAX_RESULTS]
 
