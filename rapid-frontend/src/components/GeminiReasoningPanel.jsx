@@ -154,8 +154,9 @@ export default function GeminiReasoningPanel({ result, elapsed }) {
         <div className="flex gap-3 flex-wrap">
           {[
             { label: 'OSM', desc: 'OpenStreetMap — real location',   color: 'text-blue-400 border-blue-800' },
+            { label: 'ORS', desc: 'Real road-network ETA',           color: 'text-green-400 border-green-800' },
             { label: 'SIM', desc: 'Simulated — deterministic seed',   color: 'text-amber-400 border-amber-800' },
-            { label: 'EST', desc: 'Estimated — haversine + speed',    color: 'text-slate-400 border-slate-700' },
+            { label: 'EST', desc: 'Haversine — speed estimate',       color: 'text-slate-400 border-slate-700' },
           ].map(b => (
             <div key={b.label} className="flex items-center gap-1.5">
               <span className={`text-xs px-1 rounded border font-mono ${b.color}`}>{b.label}</span>

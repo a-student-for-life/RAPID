@@ -15,7 +15,7 @@ export default function DemoControls({ onLoadScenario, onReset, forceFallback, o
             className="w-full text-left px-3 py-2 rounded bg-rapid-surface border border-rapid-border hover:border-blue-500 transition-colors group"
           >
             <div className="flex items-center gap-2">
-              <span className="text-base">{i === 0 ? '🚂' : '🏗️'}</span>
+              <span className="text-base">{scenario.icon ?? '🚨'}</span>
               <div>
                 <p className="text-xs font-semibold text-slate-200 group-hover:text-blue-300 transition-colors">
                   {scenario.label}

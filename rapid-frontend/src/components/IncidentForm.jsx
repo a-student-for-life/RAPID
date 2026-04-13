@@ -1,4 +1,6 @@
 import React, { useState } from 'react'
+import AddressSearch from './AddressSearch.jsx'
+import VoiceInput    from './VoiceInput.jsx'
 
 const SEVERITIES = ['critical', 'moderate', 'minor']
 const INJURY_TYPES = ['', 'burns', 'neuro', 'cardiac', 'ortho', 'trauma', 'general']
@@ -9,7 +11,7 @@ const SEVERITY_COLORS = {
   minor:    'border-green-500 text-green-400',
 }
 
-export default function IncidentForm({ onSubmit, loading, initialValues }) {
+export default function IncidentForm({ onSubmit, loading, initialValues, locationOverride }) {
   const [lat, setLat]   = useState(initialValues?.lat  ?? '19.0728')
   const [lon, setLon]   = useState(initialValues?.lon  ?? '72.8826')
   const [groups, setGroups] = useState(
@@ -19,20 +21,60 @@ export default function IncidentForm({ onSubmit, loading, initialValues }) {
       { severity: 'minor',    count: 12, injury_type: '' },
     ],
   )
+  const [gpsLoading, setGpsLoading] = useState(false)
+  const [gpsError,   setGpsError]   = useState(null)
 
-  // Sync when initialValues change (demo scenario loaded)
+  // Sync when a demo scenario is loaded
   React.useEffect(() => {
     if (initialValues) {
       setLat(String(initialValues.lat))
       setLon(String(initialValues.lon))
-      setGroups(
-        initialValues.patients.map(p => ({
-          ...p,
-          injury_type: p.injury_type ?? '',
-        })),
-      )
+      setGroups(initialValues.patients.map(p => ({ ...p, injury_type: p.injury_type ?? '' })))
     }
   }, [initialValues])
+
+  // Sync when user clicks on map
+  React.useEffect(() => {
+    if (locationOverride) {
+      setLat(locationOverride.lat.toFixed(6))
+      setLon(locationOverride.lon.toFixed(6))
+    }
+  }, [locationOverride])
+
+  function handleGPS() {
+    if (!navigator.geolocation) { setGpsError('Geolocation not supported'); return }
+    setGpsLoading(true)
+    setGpsError(null)
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLat(pos.coords.latitude.toFixed(6))
+        setLon(pos.coords.longitude.toFixed(6))
+        setGpsLoading(false)
+      },
+      (err) => {
+        setGpsError('Location denied')
+        setGpsLoading(false)
+      },
+      { timeout: 8000 },
+    )
+  }
+
+  function handleAddressSelect({ lat: a, lon: o }) {
+    setLat(a.toFixed(6))
+    setLon(o.toFixed(6))
+  }
+
+  function handleVoiceParsed(data) {
+    if (data.lat != null)  setLat(data.lat.toFixed(6))
+    if (data.lon != null)  setLon(data.lon.toFixed(6))
+    if (data.patient_groups?.length > 0) {
+      setGroups(data.patient_groups.map(g => ({
+        severity:    g.severity   || 'moderate',
+        count:       g.count      || 1,
+        injury_type: g.injury_type || '',
+      })))
+    }
+  }
 
   function updateGroup(i, field, value) {
     setGroups(prev => prev.map((g, idx) => idx === i ? { ...g, [field]: value } : g))
@@ -66,11 +108,36 @@ export default function IncidentForm({ onSubmit, loading, initialValues }) {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-3">
+      {/* Location search */}
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+            Incident Location
+          </p>
+          <button
+            type="button"
+            onClick={handleGPS}
+            disabled={gpsLoading}
+            title="Use my current GPS location"
+            className="text-xs px-2 py-0.5 rounded border border-rapid-border text-slate-400
+                       hover:border-blue-500 hover:text-blue-300 transition-colors disabled:opacity-50"
+          >
+            {gpsLoading ? '…' : '📍 GPS'}
+          </button>
+        </div>
+
+        <AddressSearch onSelect={handleAddressSelect} />
+        {gpsError && <p className="text-xs text-red-400 mt-1">{gpsError}</p>}
+        <p className="text-xs text-slate-600 mt-1">Or click map · or enter coordinates below</p>
+      </div>
+
+      {/* Voice input */}
+      <section className="pt-1 border-t border-rapid-border">
+        <VoiceInput onParsed={handleVoiceParsed} />
+      </section>
+
       {/* Coordinates */}
       <div>
-        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">
-          Incident Location
-        </p>
         <div className="flex gap-2">
           <div className="flex-1">
             <label className="block text-xs text-slate-500 mb-1">Latitude</label>
