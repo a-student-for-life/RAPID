@@ -18,6 +18,8 @@ dist/
 # Credentials — never commit
 serviceAccountKey*.json
 *.json.json
+rapid-e8121-4930ce74cf19*.json
+
 
 # Misc
 *.log
