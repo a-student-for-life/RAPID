@@ -22,6 +22,15 @@ _firebase_admin   = None
 _fcm_initialized  = False
 
 
+def disable() -> None:
+    """Proactively disable Firestore (called when Google is unreachable at startup).
+    Prevents gRPC from spawning background auth-retry threads."""
+    global _db, _init_attempted
+    _init_attempted = True
+    _db = None
+    logger.warning("Firestore forcibly disabled — all operations will no-op.")
+
+
 # ── Firestore ──────────────────────────────────────────────────────────────────
 
 def _get_db():

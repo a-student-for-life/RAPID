@@ -21,8 +21,10 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
       { severity: 'minor',    count: 12, injury_type: '' },
     ],
   )
-  const [gpsLoading, setGpsLoading] = useState(false)
-  const [gpsError,   setGpsError]   = useState(null)
+  const [gpsLoading,    setGpsLoading]    = useState(false)
+  const [gpsError,      setGpsError]      = useState(null)
+  const [locationLabel, setLocationLabel] = useState(null)   // resolved address label
+  const [locationWarn,  setLocationWarn]  = useState(null)   // geocode failure warning
 
   // Sync when a demo scenario is loaded
   React.useEffect(() => {
@@ -30,6 +32,8 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
       setLat(String(initialValues.lat))
       setLon(String(initialValues.lon))
       setGroups(initialValues.patients.map(p => ({ ...p, injury_type: p.injury_type ?? '' })))
+      setLocationLabel(null)
+      setLocationWarn(null)
     }
   }, [initialValues])
 
@@ -38,6 +42,8 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
     if (locationOverride) {
       setLat(locationOverride.lat.toFixed(6))
       setLon(locationOverride.lon.toFixed(6))
+      setLocationLabel(`Map pin: ${locationOverride.lat.toFixed(4)}, ${locationOverride.lon.toFixed(4)}`)
+      setLocationWarn(null)
     }
   }, [locationOverride])
 
@@ -49,9 +55,11 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
       (pos) => {
         setLat(pos.coords.latitude.toFixed(6))
         setLon(pos.coords.longitude.toFixed(6))
+        setLocationLabel(`GPS: ${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`)
+        setLocationWarn(null)
         setGpsLoading(false)
       },
-      (err) => {
+      () => {
         setGpsError('Location denied')
         setGpsLoading(false)
       },
@@ -59,18 +67,28 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
     )
   }
 
-  function handleAddressSelect({ lat: a, lon: o }) {
+  function handleAddressSelect({ lat: a, lon: o, label }) {
     setLat(a.toFixed(6))
     setLon(o.toFixed(6))
+    setLocationLabel(label ? label.split(',').slice(0, 3).join(', ') : `${a.toFixed(4)}, ${o.toFixed(4)}`)
+    setLocationWarn(null)
   }
 
   function handleVoiceParsed(data) {
-    if (data.lat != null)  setLat(data.lat.toFixed(6))
-    if (data.lon != null)  setLon(data.lon.toFixed(6))
+    if (data.lat != null && data.lon != null) {
+      setLat(data.lat.toFixed(6))
+      setLon(data.lon.toFixed(6))
+      const place = data.location_text || `${data.lat.toFixed(4)}, ${data.lon.toFixed(4)}`
+      setLocationLabel(`Voice: ${place}`)
+      setLocationWarn(null)
+    } else if (data.location_text) {
+      // Geocoding failed for the mentioned location — warn the user
+      setLocationWarn(`Could not find "${data.location_text}" — please search the address or enter coordinates manually.`)
+    }
     if (data.patient_groups?.length > 0) {
       setGroups(data.patient_groups.map(g => ({
-        severity:    g.severity   || 'moderate',
-        count:       g.count      || 1,
+        severity:    g.severity    || 'moderate',
+        count:       g.count       || 1,
         injury_type: g.injury_type || '',
       })))
     }
@@ -128,6 +146,12 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
 
         <AddressSearch onSelect={handleAddressSelect} />
         {gpsError && <p className="text-xs text-red-400 mt-1">{gpsError}</p>}
+        {locationWarn && (
+          <p className="text-xs text-amber-400 mt-1">⚠ {locationWarn}</p>
+        )}
+        {locationLabel && !locationWarn && (
+          <p className="text-xs text-green-400 mt-1 truncate">✓ {locationLabel}</p>
+        )}
         <p className="text-xs text-slate-600 mt-1">Or click map · or enter coordinates below</p>
       </div>
 
@@ -145,7 +169,7 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
               type="number"
               step="any"
               value={lat}
-              onChange={e => setLat(e.target.value)}
+              onChange={e => { setLat(e.target.value); setLocationLabel(null); setLocationWarn(null) }}
               className="w-full bg-rapid-bg border border-rapid-border rounded px-2 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
               placeholder="19.0728"
               required
@@ -157,7 +181,7 @@ export default function IncidentForm({ onSubmit, loading, initialValues, locatio
               type="number"
               step="any"
               value={lon}
-              onChange={e => setLon(e.target.value)}
+              onChange={e => { setLon(e.target.value); setLocationLabel(null); setLocationWarn(null) }}
               className="w-full bg-rapid-bg border border-rapid-border rounded px-2 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
               placeholder="72.8826"
               required

@@ -135,16 +135,31 @@ async def _extract(transcript: str) -> dict[str, Any]:
 # ── Step 3: Nominatim geocoding ───────────────────────────────────────────────
 
 async def _geocode(location_text: str) -> tuple[float | None, float | None]:
-    try:
+    """
+    Geocode a location string to lat/lon via Nominatim.
+    First tries India-restricted search (countrycodes=in), then falls back
+    to a global search so overseas place names still resolve.
+    """
+    async def _query(params: dict) -> list:
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get(
                 _NOMINATIM_URL,
-                params={"q": location_text, "format": "json", "limit": 1},
+                params=params,
                 headers={"User-Agent": "RAPID-Emergency-Dispatcher"},
             )
-        data = response.json()
+        return response.json()
+
+    try:
+        # Try India first (matches AddressSearch frontend behaviour)
+        data = await _query({"q": location_text, "format": "json", "limit": 1, "countrycodes": "in"})
+        if not data:
+            # Fall back to global search
+            data = await _query({"q": location_text, "format": "json", "limit": 1})
         if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
+            lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+            logger.info("Geocoded '%s' → %.5f, %.5f", location_text, lat, lon)
+            return lat, lon
+        logger.warning("Nominatim returned no results for: %s", location_text)
     except Exception as exc:
         logger.warning("Nominatim geocoding failed: %s", exc)
     return None, None

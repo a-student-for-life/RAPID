@@ -20,7 +20,7 @@ function buildDraftAlerts(result) {
 
   return [
     {
-      icon: '📟', agency: 'NDRF Mumbai',
+      icon: '📟', agency: 'NDRF',
       message: `MCI — ${totalPatients} casualties (${criticalCount} critical)${injuryTypes ? `, ${injuryTypes}` : ''}. Primary: ${primaryHosp}${secondHosp ? ` & ${secondHosp}` : ''}. Requesting rapid response teams.`,
     },
     {
@@ -30,11 +30,11 @@ function buildDraftAlerts(result) {
         : `O-negative surge request — ${criticalCount} critical patients in transit.`,
     },
     {
-      icon: '🚦', agency: 'Mumbai Traffic Control',
+      icon: '🚦', agency: 'Local Traffic Control',
       message: `Emergency corridor to ${primaryHosp}${secondHosp ? ` & ${secondHosp}` : ''}. Multiple ambulances dispatched.`,
     },
     {
-      icon: '🏥', agency: 'DMER Maharashtra',
+      icon: '🏥', agency: 'State DMER',
       message: `Surge protocol active. ${totalPatients} casualties across ${assignedHospitals.length} hospitals. Trauma team standby requested.`,
     },
   ]

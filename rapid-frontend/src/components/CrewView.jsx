@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 
 import { db } from '../firebaseConfig.js'
-import { doc, onSnapshot, updateDoc } from 'firebase/firestore'
+import { doc, onSnapshot, updateDoc, deleteDoc } from 'firebase/firestore'
 
 /* ── Unit identity ───────────────────────────────────────────────────────────── */
 
@@ -59,25 +59,71 @@ function parseUnitFromHash() {
 
 function lsKey(unit) { return `rapid_crew_${unit}` }
 
+/** Haversine distance in km between two lat/lon points. */
+function distKm(lat1, lon1, lat2, lon2) {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLon = (lon2 - lon1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
+    * Math.sin(dLon / 2) ** 2
+  return R * 2 * Math.asin(Math.sqrt(a))
+}
+
+/**
+ * Build a Google Maps directions URL.
+ *
+ * Source logic:
+ *  - GPS available AND within 50 km of the incident → use GPS as origin
+ *    (genuine local deployment: shows full GPS → scene → hospital route)
+ *  - Otherwise (GPS denied, GPS far away, or no scene coords) →
+ *    use incident scene as origin when en-route, or omit origin when at-scene
+ *    (keeps the map showing a sensible local route for demos/remote testers)
+ */
 function buildNavUrl(assignment, crewPos, atScene) {
   if (!assignment?.hospital_lat || !assignment?.hospital_lon) return null
+
   const hosp     = `${assignment.hospital_lat},${assignment.hospital_lon}`
   const hasScene = !!(assignment?.incident_lat && assignment?.incident_lon)
   const scene    = hasScene ? `${assignment.incident_lat},${assignment.incident_lon}` : null
 
+  // Is the device GPS actually near the incident? (≤50 km = real local use)
+  const gpsNearby = crewPos && hasScene
+    ? distKm(crewPos.lat, crewPos.lon, assignment.incident_lat, assignment.incident_lon) <= 50
+    : crewPos && !hasScene   // no scene: trust GPS regardless
+      ? distKm(crewPos.lat, crewPos.lon, assignment.hospital_lat, assignment.hospital_lon) <= 50
+      : false
+
   let url = 'https://www.google.com/maps/dir/?api=1'
-  if (crewPos) url += `&origin=${crewPos.lat},${crewPos.lon}`
-  // Add incident scene as waypoint only if crew hasn't arrived there yet
-  if (scene && !atScene) url += `&waypoints=${scene}`
-  url += `&destination=${hosp}`
+
+  if (atScene) {
+    // Crew is at scene — navigate straight to hospital
+    if (gpsNearby) url += `&origin=${crewPos.lat},${crewPos.lon}`
+    url += `&destination=${hosp}`
+  } else if (scene) {
+    if (gpsNearby) {
+      // Full 3-stop route: GPS position → incident scene → hospital
+      url += `&origin=${crewPos.lat},${crewPos.lon}&waypoints=${scene}`
+    } else {
+      // GPS unavailable or too far — use incident scene as the starting point
+      // so the map shows the correct local route: scene → hospital
+      url += `&origin=${scene}`
+    }
+    url += `&destination=${hosp}`
+  } else {
+    // No incident coords — route from GPS (if nearby) to hospital
+    if (gpsNearby) url += `&origin=${crewPos.lat},${crewPos.lon}`
+    url += `&destination=${hosp}`
+  }
+
   url += '&travelmode=driving'
   return url
 }
 
-function navLabel(crewPos, hasScene, atScene) {
-  if (atScene)             return 'NAVIGATE TO HOSPITAL'
-  if (crewPos && hasScene) return 'NAVIGATE — SCENE → HOSPITAL'
-  if (hasScene)            return 'NAVIGATE — SCENE → HOSPITAL'
+function navLabel(crewPos, hasScene, atScene, gpsNearby) {
+  if (atScene)                  return 'NAVIGATE TO HOSPITAL'
+  if (gpsNearby && hasScene)    return 'NAVIGATE — GPS → SCENE → HOSPITAL'
+  if (hasScene)                 return 'NAVIGATE — SCENE → HOSPITAL'
   return 'NAVIGATE TO HOSPITAL'
 }
 
@@ -153,7 +199,15 @@ export default function CrewView() {
   const checks   = CHECKLISTS[assignment?.injury_type] || CHECKLISTS.general
   const hasScene = !!(assignment?.incident_lat && assignment?.incident_lon)
   const atScene  = crewStatus === 'on_scene' || crewStatus === 'completed'
-  const navUrl   = buildNavUrl(assignment, crewPos, atScene)
+
+  // True only when device GPS is actually close to the incident (≤50 km)
+  const gpsNearby = crewPos && hasScene
+    ? distKm(crewPos.lat, crewPos.lon, assignment.incident_lat, assignment.incident_lon) <= 50
+    : crewPos && assignment?.hospital_lat
+      ? distKm(crewPos.lat, crewPos.lon, assignment.hospital_lat, assignment.hospital_lon) <= 50
+      : false
+
+  const navUrl    = buildNavUrl(assignment, crewPos, atScene)
   const statusCfg = STATUS_CFG[crewStatus] || STATUS_CFG.dispatched
 
   function applyData(data) {
@@ -234,6 +288,11 @@ export default function CrewView() {
     // After 5 s: clear assignment and return to STANDBY
     clearTimer.current = setTimeout(() => {
       try { localStorage.removeItem(lsKey(unitId)) } catch {}
+      // Delete Firestore doc so the dispatcher board resets to STANDBY
+      if (db) {
+        deleteDoc(doc(db, 'crew_assignments', unitId))
+          .catch(err => console.warn('[CrewView] Firestore delete:', err?.message))
+      }
       setAssignment(null)
       setCrewStatus('dispatched')
       setMissionDone(false)
@@ -354,7 +413,7 @@ export default function CrewView() {
             className={`flex items-center justify-center gap-2 w-full py-4 rounded-2xl font-black text-base
                         text-white border-2 ${c.ring} ${c.navBtn} shadow-lg transition-all active:scale-95`}>
             <span>🗺</span>
-            <span>{navLabel(crewPos, hasScene, atScene)}</span>
+            <span>{navLabel(crewPos, hasScene, atScene, gpsNearby)}</span>
           </a>
         ) : (
           <div className="w-full text-center py-3 rounded-2xl border-2 border-slate-700 bg-slate-900/50 text-slate-500 text-sm">
@@ -365,18 +424,20 @@ export default function CrewView() {
         {/* GPS status */}
         <div className="flex gap-2 flex-wrap">
           <span className={`text-xs px-2.5 py-1 rounded-lg border font-semibold ${
-            geoState === 'ok'         ? 'bg-green-950/40 border-green-800 text-green-400' :
-            geoState === 'denied'     ? 'bg-amber-950/40 border-amber-800 text-amber-400' :
+            gpsNearby             ? 'bg-green-950/40 border-green-800 text-green-400' :
+            geoState === 'ok'     ? 'bg-amber-950/40 border-amber-800 text-amber-400' :
+            geoState === 'denied' ? 'bg-slate-900 border-slate-700 text-slate-500'    :
             geoState === 'requesting' ? 'bg-slate-900 border-slate-700 text-slate-500' :
                                         'bg-slate-900 border-slate-700 text-slate-600'
           }`}>
-            {geoState === 'ok'         ? '📍 GPS locked' :
-             geoState === 'denied'     ? '⚠ GPS denied' :
+            {gpsNearby             ? '📍 GPS locked — route via scene' :
+             geoState === 'ok'     ? '📍 GPS far — routing from scene' :
+             geoState === 'denied' ? '⚠ GPS denied — routing from scene' :
              geoState === 'requesting' ? '⏳ Getting GPS…' : '📍 GPS unsupported'}
           </span>
           {hasScene && !atScene && (
             <span className="text-xs px-2.5 py-1 rounded-lg border border-blue-800 bg-blue-950/30 text-blue-400 font-semibold">
-              Route: scene → hospital
+              {gpsNearby ? 'GPS → scene → hospital' : 'scene → hospital'}
             </span>
           )}
           {atScene && (

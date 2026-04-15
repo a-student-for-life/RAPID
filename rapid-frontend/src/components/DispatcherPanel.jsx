@@ -10,20 +10,27 @@ import { doc, onSnapshot } from 'firebase/firestore'
 
 const LS_KEY = (unit) => `rapid_crew_${unit}`
 
+// A completed or standby doc means the unit is back on standby — treat as no active assignment
+function activeOrNull(d) {
+  if (!d) return null
+  if (d.status === 'completed' || d.status === 'standby') return null
+  return d
+}
+
 function useCrewDoc(unitId) {
   // Initialize from localStorage so the dispatcher status panel is instant
   const [data, setData] = useState(() => {
     try {
       const raw = localStorage.getItem(LS_KEY(unitId))
-      return raw ? JSON.parse(raw) : null
+      return activeOrNull(raw ? JSON.parse(raw) : null)
     } catch { return null }
   })
 
   useEffect(() => {
-    // Listen for cross-tab localStorage updates (crew ack, new dispatch)
+    // Listen for cross-tab localStorage updates (crew ack, new dispatch, mission clear)
     function handleStorage(e) {
       if (e.key !== LS_KEY(unitId)) return
-      try { setData(e.newValue ? JSON.parse(e.newValue) : null) } catch {}
+      try { setData(activeOrNull(e.newValue ? JSON.parse(e.newValue) : null)) } catch {}
     }
     window.addEventListener('storage', handleStorage)
 
@@ -34,8 +41,10 @@ function useCrewDoc(unitId) {
         const ref = doc(db, 'crew_assignments', unitId)
         unsub = onSnapshot(
           ref,
-          (snap) => { try { if (snap.exists()) setData(snap.data()) } catch {} },
-          (err)  => { console.warn('[Firestore]', unitId, err?.code) },
+          (snap) => {
+            try { setData(snap.exists() ? activeOrNull(snap.data()) : null) } catch {}
+          },
+          (err) => { console.warn('[Firestore]', unitId, err?.code) },
         )
       } catch (err) { console.warn('[Firestore] subscribe failed', err?.message) }
     }
