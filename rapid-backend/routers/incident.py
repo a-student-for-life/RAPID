@@ -14,13 +14,15 @@ The response schema is identical regardless of which routing path is used.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import StreamingResponse
 
 from models.schemas import IncidentRequest, IncidentResponse
-from services.location_engine import discover_hospitals_adaptive
+from services.location_engine import discover_hospitals_adaptive, discover_agencies
 from services.aggregator import fetch_hospital_data
 from services.scorer import score_all
 from services import gemini_router, groq_router, fallback_router
@@ -48,8 +50,11 @@ async def handle_incident(
     start       = time.perf_counter()
     incident_id = str(uuid.uuid4())
 
-    # ── Layer 1: hospital discovery ───────────────────────────────────────────
-    discovery = await discover_hospitals_adaptive(payload.lat, payload.lon)
+    # ── Layer 1: hospital + agency discovery (parallel) ──────────────────────
+    discovery, agencies = await asyncio.gather(
+        discover_hospitals_adaptive(payload.lat, payload.lon),
+        discover_agencies(payload.lat, payload.lon),
+    )
     hospitals = discovery["hospitals"]
 
     if not hospitals:
@@ -78,15 +83,27 @@ async def handle_incident(
         len(patient_groups),
     )
 
+    # Merge real ETAs and data source back into the hospitals list for the frontend
+    enriched_hospitals = [
+        {
+            **h,
+            "eta_minutes": hospital_data.get(h["name"], {}).get("eta_minutes", h.get("eta_minutes")),
+            "distance_km": hospital_data.get(h["name"], {}).get("distance_km") or h.get("distance_km"),
+            "eta_source":  hospital_data.get(h["name"], {}).get("eta_source", "simulated"),
+        }
+        for h in hospitals
+    ]
+
     response = IncidentResponse(
         incident_id=incident_id,
         decision_path=routing["decision_path"],
-        hospitals=hospitals,
+        hospitals=enriched_hospitals,
         scores=scores,
         assignments=routing["assignments"],
         warnings=routing.get("warnings", []),
         reasoning=routing.get("reasoning", ""),
         elapsed_s=elapsed,
+        agencies=agencies,
     )
 
     # Persist to Firestore asynchronously (does not block response)
@@ -103,6 +120,8 @@ async def handle_incident(
             "warnings":      routing.get("warnings", []),
             "reasoning":     routing.get("reasoning", ""),
             "elapsed_s":     elapsed,
+            "hospitals":     enriched_hospitals,
+            "scores":        scores,
         },
     )
 
@@ -114,6 +133,140 @@ async def list_incidents(limit: int = 10):
     """Return the most recent incidents from Firestore (newest first)."""
     incidents = await firestore_client.get_recent_incidents(limit=min(limit, 50))
     return {"incidents": incidents, "count": len(incidents)}
+
+
+@router.post("/incident/stream")
+async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
+    """
+    Streaming dispatch endpoint — identical pipeline as /incident but emits
+    SSE progress events after each layer so the UI can show a live log.
+
+    Events:  { type: "step",     step: int, done: bool, msg: str }
+             { type: "complete", result: {...} }
+             { type: "error",    msg: str }
+    """
+    async def generate():
+        start       = time.perf_counter()
+        incident_id = str(uuid.uuid4())
+
+        def evt(data: dict) -> str:
+            return f"data: {json.dumps(data)}\n\n"
+
+        try:
+            # ── Layer 1: discovery ────────────────────────────────────────────
+            yield evt({"type": "step", "step": 1, "done": False,
+                       "msg": "Scanning hospitals & agencies within 15 km radius..."})
+
+            discovery, agencies = await asyncio.gather(
+                discover_hospitals_adaptive(payload.lat, payload.lon),
+                discover_agencies(payload.lat, payload.lon),
+            )
+            hospitals = discovery["hospitals"]
+
+            if not hospitals:
+                yield evt({"type": "error",
+                           "msg": "No hospitals found within search radius."})
+                return
+
+            yield evt({"type": "step", "step": 1, "done": True,
+                       "msg": f"Found {len(hospitals)} hospitals & {len(agencies)} agencies nearby."})
+
+            # ── Layer 2: ETA + data fetch ─────────────────────────────────────
+            yield evt({"type": "step", "step": 2, "done": False,
+                       "msg": "Computing real road-network ETAs via OpenRouteService..."})
+
+            hospital_data = await fetch_hospital_data(payload.lat, payload.lon, hospitals)
+            eta_sources   = sorted({v.get("eta_source", "sim") for v in hospital_data.values()})
+
+            yield evt({"type": "step", "step": 2, "done": True,
+                       "msg": f"ETA & capacity fetched ({', '.join(eta_sources)})."})
+
+            # ── Layer 3: scoring ──────────────────────────────────────────────
+            yield evt({"type": "step", "step": 3, "done": False,
+                       "msg": "Scoring hospitals — ETA · capacity · trauma · blood stock..."})
+
+            scores = score_all(hospital_data)
+            top    = scores[0] if scores else None
+
+            yield evt({"type": "step", "step": 3, "done": True,
+                       "msg": (f"Ranked {len(scores)} hospitals. "
+                               f"#1: {top['name']} — {top['composite_score']}/100.")
+                               if top else "Scoring complete."})
+
+            # ── Layer 4: AI routing ───────────────────────────────────────────
+            patient_groups  = [pg.model_dump() for pg in payload.patients]
+            total_patients  = sum(pg["count"] for pg in patient_groups)
+            ai_label        = ("deterministic scoring engine"
+                               if payload.force_fallback else "Gemini AI (clinical reasoning)")
+
+            yield evt({"type": "step", "step": 4, "done": False,
+                       "msg": f"Routing {total_patients} patients via {ai_label}..."})
+
+            routing = await _route(scores, patient_groups, hospital_data, payload.force_fallback)
+            elapsed = round(time.perf_counter() - start, 2)
+
+            yield evt({"type": "step", "step": 4, "done": True,
+                       "msg": (f"Routing complete via {routing['decision_path']} — "
+                               f"{total_patients} patients dispatched in {elapsed}s.")})
+
+            # ── Build & emit result ───────────────────────────────────────────
+            enriched_hospitals = [
+                {
+                    **h,
+                    "eta_minutes": hospital_data.get(h["name"], {}).get("eta_minutes", h.get("eta_minutes")),
+                    "distance_km": hospital_data.get(h["name"], {}).get("distance_km") or h.get("distance_km"),
+                    "eta_source":  hospital_data.get(h["name"], {}).get("eta_source", "simulated"),
+                }
+                for h in hospitals
+            ]
+
+            response_obj = IncidentResponse(
+                incident_id=incident_id,
+                decision_path=routing["decision_path"],
+                hospitals=enriched_hospitals,
+                scores=scores,
+                assignments=routing["assignments"],
+                warnings=routing.get("warnings", []),
+                reasoning=routing.get("reasoning", ""),
+                elapsed_s=elapsed,
+                agencies=agencies,
+            )
+
+            # Persist to Firestore (non-blocking — fire and forget)
+            asyncio.create_task(
+                firestore_client.save_incident(
+                    incident_id,
+                    {
+                        "lat":            payload.lat,
+                        "lon":            payload.lon,
+                        "decision_path":  routing["decision_path"],
+                        "patient_groups": patient_groups,
+                        "patient_count":  total_patients,
+                        "assignments":    routing["assignments"],
+                        "warnings":       routing.get("warnings", []),
+                        "reasoning":      routing.get("reasoning", ""),
+                        "elapsed_s":      elapsed,
+                        "hospitals":      enriched_hospitals,
+                        "scores":         scores,
+                    },
+                )
+            )
+
+            yield evt({"type": "complete", "result": response_obj.model_dump()})
+
+        except Exception as exc:
+            logger.error("SSE stream error: %s", exc, exc_info=True)
+            yield evt({"type": "error", "msg": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "Connection":       "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── Routing helper ─────────────────────────────────────────────────────────────

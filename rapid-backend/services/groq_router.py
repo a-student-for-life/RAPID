@@ -6,6 +6,10 @@ unavailable. Uses llama-3.3-70b-versatile — fast, free tier, JSON mode.
 Acts as the second-tier AI fallback in the routing chain:
   Gemini → Groq → deterministic fallback_router
 
+Two modes (controlled by GROQ_AGENTIC env flag):
+  STANDARD (default): single prompt → assignments  (1 Groq call)
+  AGENTIC:            analyze → assign              (2 Groq calls, richer reasoning)
+
 Output schema is identical to gemini_router and fallback_router.
 """
 
@@ -26,7 +30,20 @@ _API_KEY  = os.getenv("GROQ_API_KEY", "")
 _MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 _URL      = "https://api.groq.com/openai/v1/chat/completions"
 
-_AI_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "15.0"))
+_AI_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "8.0"))
+_AGENTIC            = os.getenv("GROQ_AGENTIC", "true").lower() == "true"
+
+_ANALYZE_PROMPT = """
+You are RAPID, an AI emergency medical triage analyst.
+Given the incident data, produce a triage assessment. Return ONLY valid JSON:
+{
+  "critical_needs":    ["<what the most critical patients urgently need>"],
+  "specialty_flags":   ["<injury types requiring specialist hospitals>"],
+  "capacity_warnings": ["<hospitals that may be overwhelmed>"],
+  "load_strategy":     "<1 sentence on how to distribute patients>",
+  "priority_hospital": "<name of hospital that should receive the most critical cases>"
+}
+"""
 
 _SYSTEM_PROMPT = """
 You are RAPID, an AI emergency medical routing coordinator.
@@ -67,44 +84,77 @@ async def route_patients(
     hospital_data: dict[str, dict],
 ) -> dict[str, Any]:
     """
-    Call Groq API and return patient routing decisions.
-    Raises ValueError if GROQ_API_KEY is not set.
-    Raises on HTTP or JSON errors — caller falls back to fallback_router.
+    Route patients via Groq.
+    If GROQ_AGENTIC=true: Step 1 (analyze) → Step 2 (assign) — richer reasoning.
+    Otherwise: single-prompt mode.
     """
     if not _API_KEY:
         raise ValueError("GROQ_API_KEY not set")
 
+    if _AGENTIC:
+        return await _agentic_route(scores, patient_groups, hospital_data)
+    return await _single_route(scores, patient_groups, hospital_data)
+
+
+async def _agentic_route(
+    scores: list[dict],
+    patient_groups: list[dict],
+    hospital_data: dict[str, dict],
+) -> dict[str, Any]:
+    """Two-step: analyze then assign."""
     prompt = _build_prompt(scores, patient_groups, hospital_data)
 
-    request_body = {
-        "model":    _MODEL,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT.strip()},
-            {"role": "user",   "content": prompt},
-        ],
-        "temperature":     0.1,
-        "max_tokens":      2048,
-        "response_format": {"type": "json_object"},
-    }
-
-    async with httpx.AsyncClient(timeout=_AI_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            _URL,
-            headers={"Authorization": f"Bearer {_API_KEY}"},
-            json=request_body,
-        )
-
-    if response.status_code != 200:
-        logger.warning("Groq HTTP %d: %s", response.status_code, response.text[:300])
-    response.raise_for_status()
-
-    data = response.json()
-
+    # ── Step 1: Analyze ───────────────────────────────────────────────────────
+    analysis_raw = await _groq_call(
+        system=_ANALYZE_PROMPT.strip(),
+        user=prompt,
+        max_tokens=512,
+    )
     try:
-        raw = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise ValueError(f"Unexpected Groq response shape: {exc}") from exc
+        cleaned  = re.sub(r"```.*?\n|```", "", analysis_raw, flags=re.DOTALL).strip()
+        analysis = json.loads(cleaned)
+    except Exception:
+        analysis = {"load_strategy": analysis_raw[:200]}
 
+    logger.info("Groq agent analysis: %s", str(analysis)[:120])
+
+    # ── Step 2: Assign using analysis as extra context ────────────────────────
+    assignment_context = (
+        f"\nTRIAGE ANALYSIS (use this to guide your assignments):\n"
+        f"  Critical needs:    {analysis.get('critical_needs', [])}\n"
+        f"  Specialty flags:   {analysis.get('specialty_flags', [])}\n"
+        f"  Load strategy:     {analysis.get('load_strategy', '')}\n"
+        f"  Priority hospital: {analysis.get('priority_hospital', '')}\n"
+    )
+
+    result = await _single_route(
+        scores, patient_groups, hospital_data,
+        extra_context=assignment_context,
+    )
+    result["decision_path"] = "AI"
+
+    # Enrich reasoning with analysis insights
+    if analysis.get("load_strategy"):
+        result["reasoning"] = (
+            f"[Agent Step 1] {analysis.get('load_strategy', '')} "
+            + result.get("reasoning", "")
+        )
+    return result
+
+
+async def _single_route(
+    scores: list[dict],
+    patient_groups: list[dict],
+    hospital_data: dict[str, dict],
+    extra_context: str = "",
+) -> dict[str, Any]:
+    """Single-prompt routing call."""
+    prompt = _build_prompt(scores, patient_groups, hospital_data) + extra_context
+    raw    = await _groq_call(
+        system=_SYSTEM_PROMPT.strip(),
+        user=prompt,
+        max_tokens=2048,
+    )
     cleaned = re.sub(r"```.*?\n|```", "", raw, flags=re.DOTALL).strip()
     result  = json.loads(cleaned)
 
@@ -115,6 +165,36 @@ async def route_patients(
 
     result["decision_path"] = "AI"
     return result
+
+
+async def _groq_call(system: str, user: str, max_tokens: int = 2048) -> str:
+    """Make one Groq chat completion call and return the content string."""
+    body = {
+        "model":    _MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "temperature":     0.1,
+        "max_tokens":      max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=_AI_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            _URL,
+            headers={"Authorization": f"Bearer {_API_KEY}"},
+            json=body,
+        )
+
+    if response.status_code != 200:
+        logger.warning("Groq HTTP %d: %s", response.status_code, response.text[:300])
+    response.raise_for_status()
+
+    try:
+        return response.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as exc:
+        raise ValueError(f"Unexpected Groq response shape: {exc}") from exc
 
 
 # ── Prompt builder (shared logic with gemini_router) ──────────────────────────

@@ -1,8 +1,10 @@
 """
 Firestore Client
-Persists incidents for audit trail and history replay.
-Initialised lazily — if GOOGLE_CLOUD_PROJECT is not set or Firestore is
-unavailable, all operations silently no-op so the main pipeline is unaffected.
+Persists incidents and crew assignments. Initialised lazily — if
+GOOGLE_CLOUD_PROJECT is not set or Firestore is unavailable, all operations
+silently no-op so the main pipeline is unaffected.
+
+Also provides Firebase Admin (FCM) for push notifications to crew devices.
 """
 
 from __future__ import annotations
@@ -14,9 +16,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_db = None
-_init_attempted = False
+_db               = None
+_init_attempted   = False
+_firebase_admin   = None
+_fcm_initialized  = False
 
+
+# ── Firestore ──────────────────────────────────────────────────────────────────
 
 def _get_db():
     global _db, _init_attempted
@@ -31,7 +37,16 @@ def _get_db():
 
     try:
         from google.cloud import firestore as _fs
-        _db = _fs.AsyncClient(project=project)
+        sa_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "")
+        if sa_path:
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(
+                sa_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            _db = _fs.AsyncClient(project=project, credentials=creds)
+        else:
+            _db = _fs.AsyncClient(project=project)
         logger.info("Firestore async client initialised (project=%s).", project)
     except Exception as exc:
         logger.warning("Firestore init failed: %s", exc)
@@ -46,11 +61,31 @@ async def save_incident(incident_id: str, data: dict[str, Any]) -> None:
     if db is None:
         return
     try:
-        doc = {**data, "saved_at": datetime.now(timezone.utc).isoformat()}
+        doc = {
+            **data,
+            "hospitals": data.get("hospitals", []),
+            "scores":    data.get("scores", []),
+            "saved_at":  datetime.now(timezone.utc).isoformat(),
+        }
         await db.collection("incidents").document(incident_id).set(doc)
         logger.info("Incident %s persisted to Firestore.", incident_id)
     except Exception as exc:
         logger.warning("Firestore write failed for %s: %s", incident_id, exc)
+
+
+async def get_incident(incident_id: str) -> dict[str, Any] | None:
+    """Retrieve a single incident by ID. Returns None if not found."""
+    db = _get_db()
+    if db is None:
+        return None
+    try:
+        doc = await db.collection("incidents").document(incident_id).get()
+        if not doc.exists:
+            return None
+        return {**doc.to_dict(), "id": doc.id}
+    except Exception as exc:
+        logger.warning("Firestore get_incident failed for %s: %s", incident_id, exc)
+        return None
 
 
 async def get_recent_incidents(limit: int = 10) -> list[dict[str, Any]]:
@@ -73,3 +108,71 @@ async def get_recent_incidents(limit: int = 10) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("Firestore read failed: %s", exc)
         return []
+
+
+# ── Crew assignments ───────────────────────────────────────────────────────────
+
+async def save_crew_assignment(unit_id: str, data: dict[str, Any]) -> None:
+    """
+    Write (overwrite) a crew assignment to crew_assignments/{unit_id}.
+    The crew page subscribes to this document in real-time via Firebase JS SDK.
+    """
+    db = _get_db()
+    if db is None:
+        logger.warning("Firestore unavailable — crew assignment not saved for %s.", unit_id)
+        return
+    try:
+        doc = {
+            **data,
+            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            "status":        "dispatched",
+        }
+        await db.collection("crew_assignments").document(unit_id).set(doc)
+        logger.info("Crew assignment saved for unit %s.", unit_id)
+    except Exception as exc:
+        logger.warning("Firestore crew assignment write failed for %s: %s", unit_id, exc)
+
+
+# ── FCM push notifications ─────────────────────────────────────────────────────
+
+def _init_firebase_admin() -> bool:
+    """Initialise firebase-admin SDK once. Returns True if available."""
+    global _fcm_initialized
+    if _fcm_initialized:
+        return True
+
+    sa_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "")
+    if not sa_path:
+        logger.warning("FCM disabled — FIREBASE_SERVICE_ACCOUNT_PATH not set.")
+        _fcm_initialized = False
+        return False
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(sa_path)
+            firebase_admin.initialize_app(cred)
+        _fcm_initialized = True
+        logger.info("Firebase Admin SDK initialised (FCM enabled).")
+        return True
+    except Exception as exc:
+        logger.warning("Firebase Admin init failed: %s", exc)
+        _fcm_initialized = False
+        return False
+
+
+async def send_crew_fcm(fcm_token: str, title: str, body: str) -> None:
+    """Send a push notification to a crew device. Silent no-op on failure."""
+    if not _init_firebase_admin():
+        return
+    try:
+        from firebase_admin import messaging
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=fcm_token,
+        )
+        messaging.send(message)
+        logger.info("FCM push sent to token %s…", fcm_token[:12])
+    except Exception as exc:
+        logger.warning("FCM send failed: %s", exc)

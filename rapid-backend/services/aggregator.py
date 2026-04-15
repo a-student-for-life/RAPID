@@ -72,8 +72,9 @@ def _merge(
     eta_entry = etas.get(name, {})
 
     return {
-        "distance_km": hospital.get("distance_km", eta_entry.get("distance_km")),
+        "distance_km": eta_entry.get("distance_km") or hospital.get("distance_km"),
         "eta_minutes": eta_entry.get("eta_minutes"),
+        "eta_source":  eta_entry.get("data_source", "simulated"),
         "blood": blood.get(name, {}),
         "capacity": capacity.get(name, {}),
     }

@@ -22,8 +22,9 @@ WEIGHTS: dict[str, float] = {
 
 # ── Normalisation ceilings ─────────────────────────────────────────────────────
 # Scores saturate at these values (returns 1.0 at or above ceiling).
-_ETA_BEST_MINUTES   =  5.0   # ≤ 5 min → full score
-_ETA_WORST_MINUTES  = 30.0   # ≥ 30 min → zero
+# Urban settings (Mumbai): real road ETAs are 5-25 min; 3 min = exceptional, 25 min = poor.
+_ETA_BEST_MINUTES   =  3.0   # ≤ 3 min → full score
+_ETA_WORST_MINUTES  = 25.0   # ≥ 25 min → zero
 _ICU_CEILING        = 20     # ICU beds at which capacity saturates
 _BEDS_CEILING       = 300    # general beds at which capacity saturates
 _O_NEG_CEILING      = 10     # O-negative units at which blood saturates

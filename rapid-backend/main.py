@@ -8,7 +8,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import incident
+from routers import incident, transcribe, crew
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +28,13 @@ async def lifespan(app: FastAPI):
     else:
         from services import gemini_router as _gr
         logger.info("RAPID starting with Gemini API key configured (model: %s).", _gr._MODEL)
+
+    ors_key = os.getenv("ORS_API_KEY", "")
+    if ors_key:
+        logger.info("ORS_API_KEY loaded — real road-network ETAs enabled.")
+    else:
+        logger.warning("ORS_API_KEY not set — ETA will use haversine simulation.")
+
     yield
 
 
@@ -45,7 +52,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(incident.router, prefix="/api")
+app.include_router(incident.router,   prefix="/api")
+app.include_router(transcribe.router, prefix="/api")
+app.include_router(crew.router,       prefix="/api")
 
 
 @app.get("/health")

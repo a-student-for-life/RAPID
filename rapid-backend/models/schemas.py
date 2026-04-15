@@ -42,3 +42,4 @@ class IncidentResponse(BaseModel):
     warnings:      list[str]
     reasoning:     str = ""
     elapsed_s:     float = 0.0
+    agencies:      list[dict[str, Any]] = []

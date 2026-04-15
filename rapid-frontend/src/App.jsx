@@ -1,5 +1,4 @@
 import React, { useState, useCallback, useRef } from 'react'
-import axios from 'axios'
 
 import RapidMap             from './components/Map.jsx'
 import IncidentForm         from './components/IncidentForm.jsx'
@@ -11,6 +10,7 @@ import DispatchFeed         from './components/DispatchFeed.jsx'
 import MCIBanner            from './components/MCIBanner.jsx'
 import GoldenHourBanner     from './components/GoldenHourBanner.jsx'
 import SDGWidget            from './components/SDGWidget.jsx'
+import DispatcherPanel      from './components/DispatcherPanel.jsx'
 
 const DEFAULT_SDG_STATS = { totalPatients: 0, totalCritical: 0, totalDispatches: 0, totalElapsedMs: 0 }
 
@@ -34,20 +34,24 @@ export default function App() {
   const [dispatchDone,   setDispatchDone]   = useState(false)
   const [pendingTotal,   setPendingTotal]   = useState(0)
   const [pendingTypes,   setPendingTypes]   = useState([])
+  const [streamLogs,     setStreamLogs]     = useState([])   // SSE log entries
 
   // SDG stats (persisted in localStorage — never reset on handleReset)
   const [sdgStats, setSdgStats] = useState(loadSdgStats)
 
+  const [showDispatcher, setShowDispatcher] = useState(false)
+
   const dismissTimer = useRef(null)
 
+  /* ── SSE streaming dispatch ──────────────────────────────────────────────── */
   const handleSubmit = useCallback(async (payload) => {
     setLoading(true)
     setError(null)
     setResult(null)
     setDispatchDone(false)
+    setStreamLogs([])
     setIncident({ lat: payload.lat, lon: payload.lon })
 
-    // Capture pending totals for the dispatch feed
     const total = payload.patients.reduce((s, p) => s + p.count, 0)
     const types = [...new Set(payload.patients.map(p => p.injury_type).filter(Boolean))]
     setPendingTotal(total)
@@ -55,37 +59,74 @@ export default function App() {
 
     const t0 = Date.now()
     try {
-      const res = await axios.post('/api/incident', {
-        ...payload,
-        force_fallback: forceFallback,
+      const response = await fetch('/api/incident/stream', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ...payload, force_fallback: forceFallback }),
       })
-      const elapsedSec = ((Date.now() - t0) / 1000).toFixed(2)
-      setElapsed(elapsedSec)
-      setResult(res.data)
-      setDispatchDone(true)
-      setHistRefresh(n => n + 1)
 
-      // Update SDG stats
-      const newCritical = (res.data.assignments || [])
-        .filter(a => a.severity === 'critical')
-        .reduce((s, a) => s + a.patients_assigned, 0)
-      const newStats = {
-        totalPatients:   sdgStats.totalPatients + total,
-        totalCritical:   sdgStats.totalCritical + newCritical,
-        totalDispatches: sdgStats.totalDispatches + 1,
-        totalElapsedMs:  sdgStats.totalElapsedMs + (Date.now() - t0),
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(text || `Server error ${response.status}`)
       }
-      setSdgStats(newStats)
-      localStorage.setItem('rapid_sdg_stats', JSON.stringify(newStats))
 
-      // Auto-dismiss feed after complete step shows (1.4s in DispatchFeed) + buffer
-      dismissTimer.current = setTimeout(() => setLoading(false), 1800)
+      const reader  = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer    = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const messages = buffer.split('\n\n')
+        buffer = messages.pop() ?? ''
+
+        for (const msg of messages) {
+          const line = msg.trim()
+          if (!line.startsWith('data: ')) continue
+
+          let data
+          try { data = JSON.parse(line.slice(6)) } catch { continue }
+
+          if (data.type === 'step') {
+            setStreamLogs(prev => {
+              const idx = prev.findIndex(e => e.step === data.step)
+              if (idx >= 0) {
+                const next = [...prev]
+                next[idx] = data
+                return next
+              }
+              return [...prev, data]
+            })
+          } else if (data.type === 'complete') {
+            const elapsedSec = ((Date.now() - t0) / 1000).toFixed(2)
+            setElapsed(elapsedSec)
+            setResult(data.result)
+            setDispatchDone(true)
+            setHistRefresh(n => n + 1)
+
+            const newCritical = (data.result.assignments || [])
+              .filter(a => a.severity === 'critical')
+              .reduce((s, a) => s + a.patients_assigned, 0)
+            const newStats = {
+              totalPatients:   sdgStats.totalPatients + total,
+              totalCritical:   sdgStats.totalCritical + newCritical,
+              totalDispatches: sdgStats.totalDispatches + 1,
+              totalElapsedMs:  sdgStats.totalElapsedMs + (Date.now() - t0),
+            }
+            setSdgStats(newStats)
+            localStorage.setItem('rapid_sdg_stats', JSON.stringify(newStats))
+
+            dismissTimer.current = setTimeout(() => setLoading(false), 1800)
+          } else if (data.type === 'error') {
+            setError(data.msg)
+            setLoading(false)
+          }
+        }
+      }
     } catch (err) {
-      setError(
-        err.response?.data?.detail
-          || err.message
-          || 'Request failed — is the backend running?',
-      )
+      setError(err.message || 'Request failed — is the backend running?')
       setLoading(false)
     }
   }, [forceFallback, sdgStats])
@@ -106,9 +147,7 @@ export default function App() {
     // sdgStats intentionally NOT reset — accumulates across session
   }
 
-  function handleLocationSelect(coords) {
-    setMapLocation(coords)
-  }
+  function handleLocationSelect(coords) { setMapLocation(coords) }
 
   function handleFeedDismiss() {
     if (dismissTimer.current) clearTimeout(dismissTimer.current)
@@ -120,13 +159,10 @@ export default function App() {
     (result?.hospitals || []).map(h => [h.name, h])
   )
 
-  const totalPatients = result?.assignments?.reduce((s, a) => s + a.patients_assigned, 0) ?? 0
-  const criticalCount = result?.assignments?.filter(a => a.severity === 'critical')
-                                            .reduce((s, a) => s + a.patients_assigned, 0) ?? 0
-
-  const isMCI = result ? (totalPatients >= 30 || criticalCount >= 10) : false
-
-  // Pre-dispatch MCI signal (from loaded scenario, before dispatch)
+  const totalPatients  = result?.assignments?.reduce((s, a) => s + a.patients_assigned, 0) ?? 0
+  const criticalCount  = result?.assignments?.filter(a => a.severity === 'critical')
+                                             .reduce((s, a) => s + a.patients_assigned, 0) ?? 0
+  const isMCI  = result ? (totalPatients >= 30 || criticalCount >= 10) : false
   const preMCI = !result && demoValues
     ? (() => {
         const t = (demoValues.patients || []).reduce((s, p) => s + p.count, 0)
@@ -134,7 +170,6 @@ export default function App() {
         return t >= 30 || c >= 10
       })()
     : false
-
   const showMCI = isMCI || preMCI
 
   return (
@@ -142,9 +177,7 @@ export default function App() {
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className={`flex items-center justify-between px-4 py-2.5 border-b shrink-0 transition-colors duration-700 ${
-        showMCI
-          ? 'bg-red-950/70 border-red-900'
-          : 'bg-rapid-surface border-rapid-border'
+        showMCI ? 'bg-red-950/70 border-red-900' : 'bg-rapid-surface border-rapid-border'
       }`}>
         <div className="flex items-center gap-2.5">
           <span className="text-2xl">🚑</span>
@@ -165,6 +198,12 @@ export default function App() {
                 {result.decision_path === 'AI' ? '✦ Gemini AI' : '⚡ Fallback'}
               </span>
               <span className="text-slate-500">{elapsed}s · {totalPatients} routed</span>
+              <button
+                onClick={() => setShowDispatcher(true)}
+                className="px-3 py-1 rounded-full font-black text-sm bg-blue-600 text-white border border-blue-500 hover:bg-blue-500 transition-colors shadow-lg shadow-blue-900/40"
+              >
+                COMMAND CENTER ↗
+              </button>
             </div>
           )}
           {showMCI && (
@@ -190,7 +229,6 @@ export default function App() {
         <aside className="w-72 shrink-0 flex flex-col border-r border-rapid-border overflow-y-auto">
           <div className="p-3 space-y-4">
 
-            {/* Dispatch form */}
             <section>
               <IncidentForm
                 onSubmit={handleSubmit}
@@ -206,7 +244,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Demo controls */}
             <section className="pt-2 border-t border-rapid-border">
               <DemoControls
                 onLoadScenario={handleLoadScenario}
@@ -217,7 +254,6 @@ export default function App() {
               />
             </section>
 
-            {/* Incident history */}
             <section className="pt-2 border-t border-rapid-border">
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">
                 Recent Incidents
@@ -228,7 +264,6 @@ export default function App() {
               />
             </section>
 
-            {/* SDG Impact Widget */}
             <section className="pt-2 border-t border-rapid-border">
               <SDGWidget stats={sdgStats} />
             </section>
@@ -238,10 +273,8 @@ export default function App() {
         {/* Centre — Map */}
         <main className="flex-1 flex flex-col overflow-hidden">
 
-          {/* MCI Banner (above map) */}
           <MCIBanner isMCI={showMCI} result={result} />
 
-          {/* Map */}
           <div
             className={`flex-1 relative transition-all duration-700 ${showMCI ? 'mci-map-pulse' : ''}`}
             style={{ minHeight: 0 }}
@@ -255,14 +288,13 @@ export default function App() {
                 isDone={dispatchDone}
                 elapsed={elapsed}
                 onDismiss={handleFeedDismiss}
+                streamLogs={streamLogs}
               />
             )}
           </div>
 
-          {/* Golden Hour Banner */}
           {result && <GoldenHourBanner result={result} />}
 
-          {/* Hospital cards strip */}
           {result && (
             <div className="h-52 shrink-0 border-t border-rapid-border bg-rapid-surface overflow-x-auto overflow-y-hidden">
               <div className="flex gap-3 p-3 h-full">
@@ -295,6 +327,16 @@ export default function App() {
         </aside>
 
       </div>
+
+      {/* Dispatcher / Command Center */}
+      {showDispatcher && (
+        <DispatcherPanel
+          result={result}
+          hospitalMap={hospitalMap}
+          incidentLocation={incident}
+          onClose={() => setShowDispatcher(false)}
+        />
+      )}
     </div>
   )
 }

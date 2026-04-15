@@ -108,8 +108,14 @@ async def route_patients(
                            response.status_code, attempt, max_attempts, response.text[:300])
 
         if response.status_code == 429 and attempt < max_attempts:
-            retry_after = int(response.headers.get("Retry-After", 10))
-            logger.warning("Retrying in %ds.", retry_after)
+            # Quota exhaustion (daily limit) won't recover with retries — fail fast
+            body = response.text
+            if "quota" in body.lower() or "billing" in body.lower():
+                logger.warning("Gemini quota exhausted — skipping retries.")
+                response.raise_for_status()
+
+            retry_after = int(response.headers.get("Retry-After", 5))
+            logger.warning("Gemini rate-limited — retrying in %ds.", retry_after)
             await asyncio.sleep(retry_after)
             continue
 

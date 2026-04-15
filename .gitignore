@@ -15,6 +15,10 @@ node_modules/
 dist/
 .next/
 
+# Credentials — never commit
+serviceAccountKey*.json
+*.json.json
+
 # Misc
 *.log
 .DS_Store

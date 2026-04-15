@@ -21,12 +21,16 @@ _cache: TTLCache = TTLCache(maxsize=256, ttl=3600)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 OVERPASS_URL     = "https://overpass-api.de/api/interpreter"
-OVERPASS_TIMEOUT = 18  # seconds
+OVERPASS_TIMEOUT = 6   # seconds — fail fast so seed fallback kicks in quickly
 RADIUS_STEP_FACTOR = 1.6
 MIN_HOSPITALS      = 3
 INITIAL_RADIUS_KM  = 15.0
 MAX_RADIUS_KM      = 30.0
 MAX_RESULTS        = 10
+
+# Circuit breaker — skip Overpass for 90 s after any failure
+import time as _time
+_overpass_down_until: float = 0.0
 
 # Pre-seeded Mumbai hospitals used when Overpass is unavailable or rate-limited.
 # Coordinates are approximate; names match simulator.py _KNOWN_HOSPITALS for
@@ -70,7 +74,7 @@ async def discover_hospitals_adaptive(
     """
     radius = initial_radius_km
 
-    while radius <= max_radius_km:
+    while radius < max_radius_km:   # strict < prevents infinite loop at ceiling
         hospitals = await _fetch_and_cache(lat, lon, radius)
         if len(hospitals) >= min_count:
             return {
@@ -78,7 +82,10 @@ async def discover_hospitals_adaptive(
                 "radius_km": radius,
                 "expanded": radius > initial_radius_km,
             }
-        radius = min(radius * RADIUS_STEP_FACTOR, max_radius_km)
+        next_r = radius * RADIUS_STEP_FACTOR
+        if next_r >= max_radius_km:
+            break
+        radius = next_r
 
     # Final attempt at max radius
     hospitals = await _fetch_and_cache(lat, lon, max_radius_km)
@@ -108,6 +115,62 @@ async def discover_hospitals_adaptive(
     }
 
 
+async def discover_agencies(
+    lat: float,
+    lon: float,
+    radius_km: float = 10.0,
+) -> list[dict]:
+    """
+    Discover fire stations and police stations near (lat, lon) via Overpass.
+    Returns up to 6 nearest agencies with type label.
+    Errors are silently swallowed — agencies are informational only.
+    """
+    radius_m = int(radius_km * 1000)
+    query = (
+        f"[out:json];"
+        f"("
+        f"  node[amenity=fire_station](around:{radius_m},{lat},{lon});"
+        f"  way[amenity=fire_station](around:{radius_m},{lat},{lon});"
+        f"  node[amenity=police](around:{radius_m},{lat},{lon});"
+        f"  way[amenity=police](around:{radius_m},{lat},{lon});"
+        f");"
+        f"out center;"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                OVERPASS_URL,
+                data={"data": query},
+                timeout=10,
+            )
+            response.raise_for_status()
+        elements = response.json().get("elements", [])
+    except Exception as exc:
+        logger.warning("Agency discovery failed (%s) — skipping.", exc)
+        return []
+
+    agencies = []
+    for element in elements:
+        tags    = element.get("tags", {})
+        name    = tags.get("name") or tags.get("amenity", "Unknown")
+        amenity = tags.get("amenity", "")
+        a_lat   = element.get("lat") or element.get("center", {}).get("lat")
+        a_lon   = element.get("lon") or element.get("center", {}).get("lon")
+        if a_lat is None or a_lon is None:
+            continue
+        agencies.append({
+            "id":           f"osm_{element['id']}",
+            "name":         name,
+            "type":         "fire_station" if amenity == "fire_station" else "police",
+            "lat":          a_lat,
+            "lon":          a_lon,
+            "distance_km":  round(haversine(lat, lon, a_lat, a_lon), 2),
+        })
+
+    agencies.sort(key=lambda a: a["distance_km"])
+    return agencies[:6]
+
+
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 async def _fetch_and_cache(lat: float, lon: float, radius_km: float) -> list[dict]:
@@ -124,7 +187,18 @@ async def _fetch_and_cache(lat: float, lon: float, radius_km: float) -> list[dic
 
 
 async def _query_overpass(lat: float, lon: float, radius_km: float) -> list[dict]:
-    """Fetch hospitals from the Overpass API and return normalised dicts."""
+    """Fetch hospitals from the Overpass API and return normalised dicts.
+
+    Circuit-breaker: after any failure, Overpass is skipped for 90 s so
+    subsequent radius-expansion attempts return instantly and the seed
+    fallback is reached without delay.
+    """
+    global _overpass_down_until
+
+    if _time.monotonic() < _overpass_down_until:
+        logger.debug("Overpass circuit-breaker active — skipping API call.")
+        return []
+
     radius_m = int(radius_km * 1000)
     query = (
         f"[out:json];"
@@ -145,7 +219,9 @@ async def _query_overpass(lat: float, lon: float, radius_km: float) -> list[dict
             response.raise_for_status()
         elements = response.json().get("elements", [])
     except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
-        logger.warning("Overpass API unavailable (%s: %s) — returning empty list.", type(exc).__name__, exc)
+        logger.warning("Overpass API unavailable (%s: %s) — activating circuit-breaker for 90 s.",
+                       type(exc).__name__, exc)
+        _overpass_down_until = _time.monotonic() + 90.0
         return []
 
     hospitals = _parse_elements(elements, lat, lon)
