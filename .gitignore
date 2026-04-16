@@ -2,6 +2,9 @@
 .env
 *.env
 
+.env.example
+*.env.example
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,6 +22,7 @@ dist/
 serviceAccountKey*.json
 *.json.json
 rapid-e8121-4930ce74cf19*.json
+rapidtts-e8121-9ab23690a133*.json
 
 
 # Misc

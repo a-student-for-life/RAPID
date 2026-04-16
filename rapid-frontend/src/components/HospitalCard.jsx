@@ -1,19 +1,19 @@
 import React, { useState } from 'react'
 
 const DATA_SOURCE_BADGE = {
-  OpenStreetMap:           { label: 'OSM', color: 'text-blue-400 border-blue-800 bg-blue-950/50' },
-  NHA_simulation:          { label: 'SIM', color: 'text-amber-400 border-amber-800 bg-amber-950/50' },
-  simulated_deterministic: { label: 'SIM', color: 'text-amber-400 border-amber-800 bg-amber-950/50' },
-  simulated:               { label: 'EST', color: 'text-slate-400 border-slate-700 bg-slate-900/50' },
-  ors:                     { label: 'ORS', color: 'text-green-400 border-green-800 bg-green-950/50' },
+  OpenStreetMap:           { label: 'OSM',  color: 'text-blue-400 border-blue-800 bg-blue-950/50'    },
+  NHA_simulation:          { label: 'ABDM', color: 'text-amber-400 border-amber-800 bg-amber-950/50' },
+  simulated_deterministic: { label: 'ABDM', color: 'text-amber-400 border-amber-800 bg-amber-950/50' },
+  simulated:               { label: 'EST',  color: 'text-slate-400 border-slate-700 bg-slate-900/50' },
+  ors:                     { label: 'ORS',  color: 'text-green-400 border-green-800 bg-green-950/50' },
   seed:                    { label: 'SEED', color: 'text-slate-400 border-slate-700 bg-slate-900/50' },
 }
 
 const SUB_SCORE_META = {
   eta:      { label: 'ETA',      color: 'bg-blue-500',   tip: 'Lower travel time = higher score (40% weight)' },
-  capacity: { label: 'Capacity', color: 'bg-green-500',  tip: 'Available ICU + beds (25% weight)' },
+  capacity: { label: 'Capacity', color: 'bg-green-500',  tip: 'ABDM: Available ICU + beds (simulated, 25% weight)' },
   trauma:   { label: 'Trauma',   color: 'bg-red-500',    tip: 'Designated trauma centre (20% weight)' },
-  blood:    { label: 'Blood O-', color: 'bg-purple-500', tip: 'O-negative units available (15% weight)' },
+  blood:    { label: 'Blood O-', color: 'bg-purple-500', tip: 'e-Raktkosh: O-negative units (simulated, 15% weight)' },
 }
 
 function ScoreBar({ id, value }) {
@@ -170,6 +170,32 @@ export default function HospitalCard({ scored, hospital, assignments, rank, allS
           )}
         </div>
       )}
+
+      {/* Hospital saturation bar — Feature 4 */}
+      {(() => {
+        const icu = hospital?.capacity?.available_icu
+        if (!icu || !hasAssignment) return null
+        const totalAssigned = myAssignments.reduce((s, a) => s + (a.patients_assigned ?? 0), 0)
+        const pct = Math.min(100, Math.round((totalAssigned / icu) * 100))
+        const barColor = pct >= 80 ? 'bg-red-500' : pct >= 50 ? 'bg-amber-400' : 'bg-green-500'
+        const textColor = pct >= 80 ? 'text-red-400' : pct >= 50 ? 'text-amber-400' : 'text-green-400'
+        return (
+          <div className="mt-2 mb-1">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] text-slate-500 uppercase tracking-wider">ICU Saturation</span>
+              <span className={`text-[10px] font-black ${textColor}`}>
+                {totalAssigned}/{icu} beds · {pct}%{pct >= 80 ? ' ⚠' : ''}
+              </span>
+            </div>
+            <div className="h-1.5 bg-rapid-bg rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ${barColor}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Assignments */}
       {hasAssignment && (

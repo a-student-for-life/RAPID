@@ -1,16 +1,18 @@
-import React, { useState, useCallback, useRef } from 'react'
+import React, { useState, useCallback, useRef, useEffect } from 'react'
 
-import RapidMap             from './components/Map.jsx'
-import IncidentForm         from './components/IncidentForm.jsx'
-import HospitalCard         from './components/HospitalCard.jsx'
-import GeminiReasoningPanel from './components/GeminiReasoningPanel.jsx'
-import IncidentHistory      from './components/IncidentHistory.jsx'
-import DemoControls         from './components/DemoControls.jsx'
-import DispatchFeed         from './components/DispatchFeed.jsx'
-import MCIBanner            from './components/MCIBanner.jsx'
-import GoldenHourBanner     from './components/GoldenHourBanner.jsx'
-import SDGWidget            from './components/SDGWidget.jsx'
-import DispatcherPanel      from './components/DispatcherPanel.jsx'
+import RapidMap          from './components/Map.jsx'
+import IncidentForm      from './components/IncidentForm.jsx'
+import HospitalCard      from './components/HospitalCard.jsx'
+import AIReasoningPanel  from './components/AIReasoningPanel.jsx'
+import IncidentHistory   from './components/IncidentHistory.jsx'
+import DemoControls      from './components/DemoControls.jsx'
+import DispatchFeed      from './components/DispatchFeed.jsx'
+import MCIBanner         from './components/MCIBanner.jsx'
+import GoldenHourBanner  from './components/GoldenHourBanner.jsx'
+import SDGWidget         from './components/SDGWidget.jsx'
+import DispatcherPanel   from './components/DispatcherPanel.jsx'
+import ComparisonPanel   from './components/ComparisonPanel.jsx'
+import { DEMO_SCENARIO } from './demoScenario.js'
 
 const DEFAULT_SDG_STATS = { totalPatients: 0, totalCritical: 0, totalDispatches: 0, totalElapsedMs: 0 }
 
@@ -39,9 +41,60 @@ export default function App() {
   // SDG stats (persisted in localStorage — never reset on handleReset)
   const [sdgStats, setSdgStats] = useState(loadSdgStats)
 
-  const [showDispatcher, setShowDispatcher] = useState(false)
+  const [showDispatcher,    setShowDispatcher]    = useState(false)
+  const [showComparison,    setShowComparison]    = useState(false)
+  const [comparisonResult,  setComparisonResult]  = useState(null)
+  const [comparisonLoading, setComparisonLoading] = useState(false)
+  const [systemStatus,      setSystemStatus]      = useState(null)
+  const [sceneIntel,        setSceneIntel]        = useState(null)  // aggregated scene reports
 
-  const dismissTimer = useRef(null)
+  const dismissTimer    = useRef(null)
+  const autoRan         = useRef(false)
+  const handleSubmitRef = useRef(null)
+
+  /* ── System status (provider pill) ──────────────────────────────────────── */
+  useEffect(() => {
+    fetch('/api/system-status')
+      .then(r => r.json())
+      .then(setSystemStatus)
+      .catch(() => {})
+  }, [])
+
+  /* ── Scene intel polling — runs whenever a dispatched incident is active ─── */
+  useEffect(() => {
+    if (!result?.incident_id) { setSceneIntel(null); return }
+    const id = result.incident_id
+
+    async function poll() {
+      try {
+        const res = await fetch(`/api/scene-assessments/${id}`)
+        if (!res.ok) return
+        const data = await res.json()
+        if (data.aggregated?.report_count > 0) setSceneIntel(data.aggregated)
+      } catch {}
+    }
+
+    poll()                                          // immediate first fetch
+    const interval = setInterval(poll, 5000)        // then every 5 s
+    return () => clearInterval(interval)
+  }, [result?.incident_id])
+
+  /* ── Auto-demo: load Kurla scenario + dispatch after 1.5s ───────────────── */
+  useEffect(() => {
+    if (autoRan.current) return
+    autoRan.current = true
+    setDemoValues(DEMO_SCENARIO)
+    const timer = setTimeout(() => {
+      if (handleSubmitRef.current) {
+        handleSubmitRef.current({
+          lat:      DEMO_SCENARIO.lat,
+          lon:      DEMO_SCENARIO.lon,
+          patients: DEMO_SCENARIO.patients,
+        })
+      }
+    }, 1500)
+    return () => clearTimeout(timer)
+  }, [])
 
   /* ── SSE streaming dispatch ──────────────────────────────────────────────── */
   const handleSubmit = useCallback(async (payload) => {
@@ -131,6 +184,9 @@ export default function App() {
     }
   }, [forceFallback, sdgStats])
 
+  // Keep ref in sync so the auto-demo effect always calls the latest version
+  handleSubmitRef.current = handleSubmit
+
   function handleLoadScenario(scenario) {
     setDemoValues(scenario)
     setResult(null)
@@ -144,7 +200,66 @@ export default function App() {
     setError(null)
     setDemoValues(null)
     setMapLocation(null)
+    setSceneIntel(null)
     // sdgStats intentionally NOT reset — accumulates across session
+  }
+
+  function handleRerunWithSceneData(patientGroups, lat, lon) {
+    const sceneLat = lat ?? incident?.lat
+    const sceneLon = lon ?? incident?.lon
+    if (!sceneLat || !sceneLon) return
+    const patients = patientGroups
+      .filter(pg => pg.count > 0)
+      .map(pg => ({ severity: pg.severity, count: pg.count, injury_type: pg.injury_type ?? null }))
+    if (!patients.length) return
+    setDemoValues({ lat: sceneLat, lon: sceneLon, patients })
+    setShowDispatcher(false)
+    handleSubmit({ lat: sceneLat, lon: sceneLon, patients })
+  }
+
+  async function handleCompare() {
+    if (!incident || !result) return
+    setShowComparison(true)
+    setComparisonResult(null)
+    setComparisonLoading(true)
+    try {
+      const payload = {
+        lat:           incident.lat,
+        lon:           incident.lon,
+        patients:      (result.assignments || []).map(a => ({
+          severity:    a.severity,
+          count:       a.patients_assigned,
+          injury_type: a.injury_type ?? null,
+        })),
+        force_fallback: true,
+      }
+      const response = await fetch('/api/incident/stream', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      })
+      if (!response.ok) throw new Error(`Server error ${response.status}`)
+      const reader  = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const messages = buffer.split('\n\n')
+        buffer = messages.pop() ?? ''
+        for (const msg of messages) {
+          const line = msg.trim()
+          if (!line.startsWith('data: ')) continue
+          let data
+          try { data = JSON.parse(line.slice(6)) } catch { continue }
+          if (data.type === 'complete') {
+            setComparisonResult(data.result)
+          }
+        }
+      }
+    } catch {}
+    finally { setComparisonLoading(false) }
   }
 
   function handleLocationSelect(coords) { setMapLocation(coords) }
@@ -188,21 +303,43 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
+          {/* Provider status pill */}
+          {systemStatus && (
+            <span className={`text-xs px-2 py-0.5 rounded-full border font-mono hidden sm:inline ${
+              systemStatus.map_provider === 'google'
+                ? 'text-green-400 border-green-800 bg-green-950/30'
+                : 'text-slate-400 border-slate-700 bg-slate-900/30'
+            }`}>
+              {systemStatus.map_provider === 'google' ? '● Google APIs' : '● OSS Mode'}
+            </span>
+          )}
+
           {result && (
             <div className="flex items-center gap-2 text-xs">
               <span className={`px-2 py-0.5 rounded-full font-semibold ${
-                result.decision_path === 'AI'
+                result.decision_path === 'groq'
                   ? 'bg-green-900/50 text-green-300 border border-green-700'
+                  : result.decision_path === 'gemini' || result.decision_path === 'AI'
+                  ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
                   : 'bg-amber-900/50 text-amber-300 border border-amber-700'
               }`}>
-                {result.decision_path === 'AI' ? '✦ Gemini AI' : '⚡ Fallback'}
+                {result.decision_path === 'groq'   ? '✦ Groq AI'
+                 : result.decision_path === 'gemini' || result.decision_path === 'AI' ? '✦ Gemini AI'
+                 : '⚡ Fallback'}
               </span>
               <span className="text-slate-500">{elapsed}s · {totalPatients} routed</span>
               <button
                 onClick={() => setShowDispatcher(true)}
-                className="px-3 py-1 rounded-full font-black text-sm bg-blue-600 text-white border border-blue-500 hover:bg-blue-500 transition-colors shadow-lg shadow-blue-900/40"
+                className="relative px-3 py-1 rounded-full font-black text-sm bg-blue-600 text-white border border-blue-500 hover:bg-blue-500 transition-colors shadow-lg shadow-blue-900/40"
               >
                 COMMAND CENTER ↗
+                {sceneIntel?.report_count > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full
+                                   bg-purple-500 border border-purple-300 text-[10px] font-black text-white
+                                   flex items-center justify-center leading-none animate-pulse">
+                    {sceneIntel.report_count}
+                  </span>
+                )}
               </button>
             </div>
           )}
@@ -251,6 +388,7 @@ export default function App() {
                 forceFallback={forceFallback}
                 onToggleFallback={() => setForceFallback(f => !f)}
                 hasResults={!!result}
+                onCompare={result ? handleCompare : null}
               />
             </section>
 
@@ -295,6 +433,86 @@ export default function App() {
 
           {result && <GoldenHourBanner result={result} />}
 
+          {/* Scene Intelligence Banner — appears when crew scene reports arrive */}
+          {result && sceneIntel?.report_count > 0 && (() => {
+            // Compute delta: scene numbers vs. original dispatch numbers
+            const origByType = {}
+            ;(result.assignments || []).forEach(a => {
+              origByType[a.severity] = (origByType[a.severity] || 0) + (a.patients_assigned || 0)
+            })
+            return (
+              <div className="shrink-0 border-t-2 border-purple-700 bg-purple-950/25 px-4 py-2.5">
+                <div className="flex items-center gap-4">
+                  {/* Label */}
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-purple-400 text-base">🔬</span>
+                    <div>
+                      <p className="text-xs font-black text-purple-300 leading-tight">
+                        Scene Intelligence · {sceneIntel.report_count} crew report{sceneIntel.report_count !== 1 ? 's' : ''}
+                      </p>
+                      <p className="text-[10px] leading-tight">
+                        <span className={
+                          sceneIntel.confidence === 'HIGH'   ? 'text-green-400 font-bold' :
+                          sceneIntel.confidence === 'MEDIUM' ? 'text-amber-400 font-bold' :
+                                                               'text-slate-500'
+                        }>{sceneIntel.confidence} CONFIDENCE</span>
+                        {sceneIntel.total_estimated != null && (
+                          <span className="text-slate-500"> · ~{sceneIntel.total_estimated} on scene</span>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Original → Scene comparison */}
+                  <div className="flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
+                    {['critical', 'moderate', 'minor'].map(sev => {
+                      const scenePg  = sceneIntel.patient_groups?.find(p => p.severity === sev)
+                      const sceneN   = scenePg?.count ?? 0
+                      const origN    = origByType[sev] ?? 0
+                      const delta    = sceneN - origN
+                      if (sceneN === 0 && origN === 0) return null
+                      const sevColor = sev === 'critical'
+                        ? 'border-red-800 bg-red-950/60 text-red-300'
+                        : sev === 'moderate'
+                        ? 'border-amber-800 bg-amber-950/60 text-amber-300'
+                        : 'border-green-800 bg-green-950/60 text-green-300'
+                      return (
+                        <span key={sev} className={`text-xs px-2 py-0.5 rounded-full border font-bold flex items-center gap-1 ${sevColor}`}>
+                          {sceneN} {sev}
+                          {delta !== 0 && (
+                            <span className={`text-[10px] font-black ${delta > 0 ? 'text-orange-400' : 'text-green-400'}`}>
+                              {delta > 0 ? `+${delta}` : delta}
+                            </span>
+                          )}
+                        </span>
+                      )
+                    })}
+                    {sceneIntel.hazard_flags?.length > 0 && (
+                      <span className="text-xs text-red-400 truncate ml-1">
+                        ⚠ {sceneIntel.hazard_flags.slice(0, 2).join(' · ')}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Rerun button */}
+                  <button
+                    onClick={() => handleRerunWithSceneData(sceneIntel.patient_groups, incident?.lat, incident?.lon)}
+                    className="shrink-0 px-3 py-1.5 rounded-lg bg-purple-700 hover:bg-purple-600 active:bg-purple-800
+                               text-white text-xs font-black transition-all shadow shadow-purple-900/40 whitespace-nowrap"
+                  >
+                    🔄 RERUN WITH SCENE DATA
+                  </button>
+                </div>
+
+                {/* Explanation line */}
+                <p className="text-[10px] text-slate-600 mt-1 leading-tight">
+                  Routing used estimated counts. Crews confirmed different numbers on scene.
+                  Click RERUN to re-dispatch with confirmed data.
+                </p>
+              </div>
+            )
+          })()}
+
           {result && (
             <div className="h-52 shrink-0 border-t border-rapid-border bg-rapid-surface overflow-x-auto overflow-y-hidden">
               <div className="flex gap-3 p-3 h-full">
@@ -314,7 +532,7 @@ export default function App() {
           )}
         </main>
 
-        {/* Right panel — Gemini reasoning */}
+        {/* Right panel — AI reasoning */}
         <aside className="w-72 shrink-0 border-l border-rapid-border bg-rapid-surface overflow-hidden">
           <div className="px-3 py-2 border-b border-rapid-border">
             <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
@@ -322,7 +540,7 @@ export default function App() {
             </p>
           </div>
           <div className="h-full overflow-y-auto pb-12">
-            <GeminiReasoningPanel result={result} elapsed={elapsed} />
+            <AIReasoningPanel result={result} elapsed={elapsed} />
           </div>
         </aside>
 
@@ -335,6 +553,17 @@ export default function App() {
           hospitalMap={hospitalMap}
           incidentLocation={incident}
           onClose={() => setShowDispatcher(false)}
+          onRerunWithSceneData={handleRerunWithSceneData}
+        />
+      )}
+
+      {/* AI vs Fallback Comparison */}
+      {showComparison && (
+        <ComparisonPanel
+          aiResult={result}
+          fallbackResult={comparisonResult}
+          fallbackLoading={comparisonLoading}
+          onClose={() => setShowComparison(false)}
         />
       )}
     </div>

@@ -1,7 +1,7 @@
 import React from 'react'
 import { ALL_SCENARIOS } from '../demoScenario.js'
 
-export default function DemoControls({ onLoadScenario, onReset, forceFallback, onToggleFallback, hasResults }) {
+export default function DemoControls({ onLoadScenario, onReset, forceFallback, onToggleFallback, hasResults, onCompare }) {
   return (
     <div className="space-y-2">
       <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Demo Controls</p>
@@ -38,6 +38,17 @@ export default function DemoControls({ onLoadScenario, onReset, forceFallback, o
       >
         {forceFallback ? '⚡ AI DISABLED — Fallback Active' : '⚡ Simulate AI Failure'}
       </button>
+
+      {/* Compare AI vs Fallback */}
+      {onCompare && (
+        <button
+          onClick={onCompare}
+          className="w-full px-3 py-2 rounded border border-green-800 text-xs font-semibold text-green-400
+                     bg-green-950/20 hover:bg-green-950/40 hover:border-green-600 transition-all"
+        >
+          ✦ Compare AI vs Fallback
+        </button>
+      )}
 
       {/* Reset */}
       {hasResults && (

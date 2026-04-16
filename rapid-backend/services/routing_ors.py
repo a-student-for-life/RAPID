@@ -1,14 +1,22 @@
 """
-Routing / ETA Service
-Fetches real road-network travel times from crash site to each hospital
-using the OpenRouteService (ORS) Matrix API.
+Routing / ETA Service — Financial Circuit Breaker Model
 
-ORS free tier: 2,000 matrix requests/day.
-To protect quota, results are cached with a 30-minute TTL keyed on
-(crash_lat, crash_lon) rounded to 3 decimal places (~110 m grid) plus
-a hash of the hospital list. Same incident area = cache hit.
+ETA priority chain (tried in order, first success wins):
 
-Falls back to haversine-based simulation if ORS is unavailable or key not set.
+  Tier 1 — Google Routes Distance Matrix API
+    Uses the $200/month renewable Maps credit.
+    Guarded by QuotaTracker: if daily cap hit or HTTP 429/403 received,
+    circuit breaker trips and Tier 2 is used for the rest of the day.
+
+  Tier 2 — OpenRouteService (ORS) Matrix API
+    Free tier: 2,000 matrix requests/day.
+    Used when Google breaker is open or ORS_API_KEY is set.
+
+  Tier 3 — Haversine estimate
+    Always available, zero cost. Used when both Tier 1 and Tier 2 fail.
+
+Results are cached for 30 minutes (TTL) keyed on rounded crash coordinates
++ hospital set hash — same incident area = cache hit across all tiers.
 """
 
 import hashlib
@@ -21,15 +29,19 @@ import httpx
 from cachetools import TTLCache
 
 from services.location_engine import haversine
+from services.quota_tracker import quota_tracker
 
 logger = logging.getLogger(__name__)
+
+_GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+_GOOGLE_ROUTES_URL = "https://routes.googleapis.com/distancematrix/v2:computeRouteMatrix"
+_GOOGLE_ROUTES_TIMEOUT = 10  # seconds
 
 _ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 _ORS_URL     = "https://api.openrouteservice.org/v2/matrix/driving-car"
 _ORS_TIMEOUT = 10  # seconds per request
 
 # Cache: keyed by (rounded crash lat/lon + hospital names hash), 30-min TTL
-# maxsize=128 covers many concurrent incidents without unbounded memory use
 _cache: TTLCache = TTLCache(maxsize=128, ttl=1800)
 
 # Haversine fallback constants
@@ -47,9 +59,8 @@ async def get_all_etas(
     """
     Return ETAs from (crash_lat, crash_lon) to every hospital.
 
-    Uses ORS matrix API if ORS_API_KEY is set; otherwise falls back to
-    haversine simulation. Results are cached for 30 minutes to preserve
-    the ORS free-tier quota (2,000 requests/day).
+    Tries Google Routes → ORS → Haversine in order.
+    Results cached 30 minutes to preserve API quotas.
     """
     if not hospitals:
         return {}
@@ -57,22 +68,128 @@ async def get_all_etas(
     cache_key = _make_cache_key(crash_lat, crash_lon, hospitals)
     cached = _cache.get(cache_key)
     if cached is not None:
-        logger.debug("ORS cache hit for %s", cache_key)
+        logger.debug("ETA cache hit for %s", cache_key)
         return cached
 
+    # ── Tier 1: Google Routes Distance Matrix (financial circuit breaker) ───────
+    if quota_tracker.should_use_google("routes"):
+        try:
+            result = await _fetch_google_routes(crash_lat, crash_lon, hospitals)
+            quota_tracker.record_success("routes")
+            _cache[cache_key] = result
+            return result
+        except httpx.HTTPStatusError as exc:
+            quota_tracker.record_error("routes", exc.response.status_code, exc.response.text)
+            logger.warning("Google Routes HTTP %d — falling back to ORS.", exc.response.status_code)
+        except Exception as exc:
+            logger.warning("Google Routes unavailable (%s: %s) — falling back to ORS.",
+                           type(exc).__name__, exc)
+
+    # ── Tier 2: OpenRouteService ────────────────────────────────────────────────
     if _ORS_API_KEY:
         try:
             result = await _fetch_ors(crash_lat, crash_lon, hospitals)
             _cache[cache_key] = result
             return result
         except Exception as exc:
-            logger.warning(
-                "ORS unavailable (%s: %s) — falling back to haversine.",
-                type(exc).__name__, exc,
-            )
+            logger.warning("ORS unavailable (%s: %s) — falling back to haversine.",
+                           type(exc).__name__, exc)
 
+    # ── Tier 3: Haversine estimate (always succeeds) ────────────────────────────
     result = {h["name"]: _haversine_eta(crash_lat, crash_lon, h) for h in hospitals}
     _cache[cache_key] = result
+    return result
+
+
+# ── Google Routes Distance Matrix ─────────────────────────────────────────────
+
+async def _fetch_google_routes(
+    crash_lat: float,
+    crash_lon: float,
+    hospitals: list[dict],
+) -> dict[str, dict[str, Any]]:
+    """
+    Call Google Routes API v2 computeRouteMatrix.
+
+    One origin (crash site) to N destinations (hospitals).
+    Returns duration_seconds and distance_meters per hospital.
+    Uses GOOGLE_MAPS_API_KEY via X-Goog-Api-Key header.
+    """
+    origins = [{"waypoint": {"location": {"latLng": {"latitude": crash_lat, "longitude": crash_lon}}}}]
+    destinations = [
+        {"waypoint": {"location": {"latLng": {"latitude": h["lat"], "longitude": h["lon"]}}}}
+        for h in hospitals
+    ]
+
+    body = {
+        "origins":      origins,
+        "destinations": destinations,
+        "travelMode":   "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
+    }
+
+    async with httpx.AsyncClient(timeout=_GOOGLE_ROUTES_TIMEOUT) as client:
+        response = await client.post(
+            _GOOGLE_ROUTES_URL,
+            headers={
+                "X-Goog-Api-Key":    _GOOGLE_MAPS_KEY,
+                "X-Goog-FieldMask":  "originIndex,destinationIndex,duration,distanceMeters,status",
+                "Content-Type":      "application/json",
+            },
+            json=body,
+        )
+
+    if response.status_code != 200:
+        logger.warning("Google Routes HTTP %d: %s", response.status_code, response.text[:300])
+        response.raise_for_status()
+
+    rows = response.json()  # list of route elements
+    result: dict[str, dict[str, Any]] = {}
+
+    for element in rows:
+        dest_idx = element.get("destinationIndex", 0)
+        if dest_idx >= len(hospitals):
+            continue
+        hospital  = hospitals[dest_idx]
+        status    = element.get("status", {})
+        condition = status.get("code", 0) if isinstance(status, dict) else 0
+
+        raw_secs = element.get("duration")
+        raw_m    = element.get("distanceMeters")
+
+        if condition != 0 or raw_secs is None:
+            # Route not found for this element — use haversine for this hospital
+            result[hospital["name"]] = _haversine_eta(crash_lat, crash_lon, hospital)
+            continue
+
+        # Google Routes v2 returns duration as proto Duration JSON:
+        #   "423s" (proto3 string) — most common via REST
+        #   {"seconds": 423, "nanos": 0} (dict) — some client configs
+        #   423 (int) — older SDKs
+        if isinstance(raw_secs, dict):
+            secs = int(raw_secs.get("seconds", 0))
+        elif isinstance(raw_secs, str):
+            secs = int(raw_secs.rstrip("s")) if raw_secs.rstrip("s").isdigit() else 0
+        else:
+            secs = int(raw_secs) if raw_secs else 0
+        eta_minutes = round(max(1.0, secs / 60.0), 1) if secs else None
+        dist_km     = round(int(raw_m) / 1000.0, 2)   if raw_m else hospital.get("distance_km")
+
+        result[hospital["name"]] = {
+            "eta_minutes": eta_minutes,
+            "distance_km": dist_km,
+            "data_source": "google_routes",
+        }
+
+    # Fill any hospitals missing from the response
+    for h in hospitals:
+        if h["name"] not in result:
+            result[h["name"]] = _haversine_eta(crash_lat, crash_lon, h)
+
+    eta_vals = [v["eta_minutes"] for v in result.values() if v["eta_minutes"] is not None]
+    if eta_vals:
+        logger.info("Google Routes matrix: %d hospitals, ETAs %.1f–%.1f min",
+                    len(hospitals), min(eta_vals), max(eta_vals))
     return result
 
 

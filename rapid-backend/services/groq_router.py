@@ -131,7 +131,7 @@ async def _agentic_route(
         scores, patient_groups, hospital_data,
         extra_context=assignment_context,
     )
-    result["decision_path"] = "AI"
+    result["decision_path"] = "groq"
 
     # Enrich reasoning with analysis insights
     if analysis.get("load_strategy"):
@@ -163,7 +163,7 @@ async def _single_route(
     if "assignments" not in result:
         raise ValueError("Invalid Groq response (missing assignments)")
 
-    result["decision_path"] = "AI"
+    result["decision_path"] = "groq"
     return result
 
 

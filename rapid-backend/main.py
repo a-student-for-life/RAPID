@@ -38,21 +38,42 @@ async def _check_google_reachable() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        logger.warning(
-            "GEMINI_API_KEY not set — Gemini routing disabled; "
-            "RAPID will operate in FALLBACK-only mode."
+    # ── AI routing chain ──────────────────────────────────────────────────────
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if groq_key:
+        logger.info("RAPID — PRIMARY AI: Groq Llama-3.3-70b (Tier 1 routing).")
+    else:
+        logger.warning("GROQ_API_KEY not set — Groq routing disabled.")
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    if gemini_key:
+        from services import gemini_router as _gr
+        logger.info("RAPID — FALLBACK AI: Gemini %s routing, gemini-2.0-flash Vision.", _gr._MODEL)
+    else:
+        logger.warning("GEMINI_API_KEY not set — Gemini fallback disabled.")
+
+    if not groq_key and not gemini_key:
+        logger.warning("No AI keys set — RAPID will run in deterministic-only mode.")
+
+    # ── Google Maps Platform (Financial Circuit Breaker) ──────────────────────
+    maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if maps_key:
+        logger.info(
+            "GOOGLE_MAPS_API_KEY loaded — Google Routes (ETA), "
+            "Places (address search) active. OSS fallback on quota errors."
         )
     else:
-        from services import gemini_router as _gr
-        logger.info("RAPID starting with Gemini API key configured (model: %s).", _gr._MODEL)
+        logger.warning(
+            "GOOGLE_MAPS_API_KEY not set — using OSS stack: "
+            "ORS (ETAs), Nominatim (address), Leaflet (map)."
+        )
 
+    # ── ETA routing ───────────────────────────────────────────────────────────
     ors_key = os.getenv("ORS_API_KEY", "")
     if ors_key:
-        logger.info("ORS_API_KEY loaded — real road-network ETAs enabled.")
+        logger.info("ORS_API_KEY loaded — Tier 2 ETA fallback ready.")
     else:
-        logger.warning("ORS_API_KEY not set — ETA will use haversine simulation.")
+        logger.warning("ORS_API_KEY not set — Tier 2 ETA will use haversine simulation.")
 
     # Probe Google's auth endpoint. If TLS fails (firewall / antivirus / proxy),
     # disable Firestore immediately so gRPC never spawns retrying auth threads.

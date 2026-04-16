@@ -171,6 +171,52 @@ def _init_firebase_admin() -> bool:
         return False
 
 
+async def save_scene_assessment(incident_id: str, unit_id: str, data: dict[str, Any]) -> None:
+    """Save a scene assessment report to scene_assessments/{incident_id}/reports/{unit_id}."""
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        doc = {
+            **data,
+            "unit_id":     unit_id,
+            "incident_id": incident_id,
+            "saved_at":    datetime.now(timezone.utc).isoformat(),
+        }
+        await (
+            db.collection("scene_assessments")
+              .document(incident_id)
+              .collection("reports")
+              .document(unit_id)
+              .set(doc)
+        )
+        logger.info("Scene assessment saved: incident=%s unit=%s", incident_id, unit_id)
+    except Exception as exc:
+        logger.warning("Firestore scene assessment write failed: %s", exc)
+
+
+async def get_scene_assessments(incident_id: str) -> list[dict[str, Any]]:
+    """Return all scene assessment reports for an incident. Empty list if unavailable."""
+    db = _get_db()
+    if db is None:
+        return []
+    try:
+        results = []
+        async for doc in (
+            db.collection("scene_assessments")
+              .document(incident_id)
+              .collection("reports")
+              .stream()
+        ):
+            entry = doc.to_dict()
+            entry["id"] = doc.id
+            results.append(entry)
+        return results
+    except Exception as exc:
+        logger.warning("Firestore get_scene_assessments failed: %s", exc)
+        return []
+
+
 async def send_crew_fcm(fcm_token: str, title: str, body: str) -> None:
     """Send a push notification to a crew device. Silent no-op on failure."""
     if not _init_firebase_admin():

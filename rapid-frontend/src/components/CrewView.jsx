@@ -171,6 +171,141 @@ function CheckItem({ text }) {
   )
 }
 
+/* ── Web Speech TTS ──────────────────────────────────────────────────────────── */
+
+function speakDispatch(assignment, callsign) {
+  if (!window.speechSynthesis || !assignment) return
+  window.speechSynthesis.cancel()
+  const injury  = assignment.injury_type ? ` ${assignment.injury_type}` : ''
+  const eta     = assignment.eta_minutes ? ` ETA ${assignment.eta_minutes} minutes.` : ''
+  const trauma  = assignment.trauma_centre ? ' Trauma centre confirmed.' : ''
+  const text    = `${callsign}. Dispatch confirmed. Proceed to ${assignment.hospital_name}. ` +
+                  `${assignment.patients_assigned}${injury} ${assignment.severity || ''} patient${assignment.patients_assigned === 1 ? '' : 's'}.` +
+                  `${eta}${trauma} Acknowledge dispatch.`
+  const utt     = new SpeechSynthesisUtterance(text)
+  utt.rate      = 0.92
+  utt.pitch     = 1.0
+  utt.volume    = 1.0
+  window.speechSynthesis.speak(utt)
+}
+
+/* ── Groq Vision Scene Assessment ───────────────────────────────────────────── */
+
+function SceneAssessButton({ unitId, incidentId }) {
+  const [state,     setState]     = useState('idle')  // idle | loading | result | error
+  const [result,    setResult]    = useState(null)
+  const [reported,  setReported]  = useState(false)
+  const [aggregated,setAggregated]= useState(null)
+  const fileRef                   = useRef(null)
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setState('loading')
+    setResult(null)
+    setReported(false)
+    setAggregated(null)
+    try {
+      const form = new FormData()
+      form.append('image', file)
+      if (unitId)     form.append('unit_id',     unitId)
+      if (incidentId) form.append('incident_id', incidentId)
+      const res = await fetch('/api/scene-assess', { method: 'POST', body: form })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setResult(data)
+      setState('result')
+      if (incidentId && unitId) {
+        setReported(true)
+        setAggregated(data.aggregated ?? null)
+      }
+    } catch (err) {
+      console.warn('[SceneAssess]', err)
+      setState('error')
+    } finally {
+      e.target.value = ''
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border border-purple-800 bg-purple-950/20 overflow-hidden">
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-purple-900">
+        <span>🔬</span>
+        <p className="text-xs font-black text-purple-300 uppercase tracking-widest">AI Vision — Scene Assessment</p>
+      </div>
+      <div className="px-4 py-3 space-y-2">
+        <input ref={fileRef} type="file" accept="image/*" capture="environment"
+               className="hidden" onChange={handleFile} />
+        <button type="button"
+                onClick={() => fileRef.current?.click()}
+                disabled={state === 'loading'}
+                className="w-full py-3 rounded-xl font-black text-sm border-2 border-purple-700 bg-purple-900/40
+                           text-purple-300 hover:bg-purple-800/40 active:scale-95 transition-all disabled:opacity-50">
+          {state === 'loading' ? '⏳ Analysing scene…' : '📷 CAPTURE SCENE PHOTO'}
+        </button>
+
+        {state === 'result' && result && (
+          <div className="space-y-2 pt-1">
+            <div className="grid grid-cols-3 gap-2">
+              {result.estimated_casualties != null && (
+                <div className="bg-[#1a1d2e] border border-[#2d3148] rounded-xl p-2 text-center">
+                  <p className="text-xl font-black text-white">{result.estimated_casualties}</p>
+                  <p className="text-xs text-slate-500">Est. casualties</p>
+                </div>
+              )}
+              {result.severity_distribution && (
+                <div className="col-span-2 bg-[#1a1d2e] border border-[#2d3148] rounded-xl p-2">
+                  <p className="text-xs font-black text-slate-500 mb-1">Severity split</p>
+                  <p className="text-xs text-slate-300">{result.severity_distribution}</p>
+                </div>
+            )}
+            </div>
+            {result.hazard_flags?.length > 0 && (
+              <div className="bg-red-950/30 border border-red-800 rounded-xl p-3">
+                <p className="text-xs font-black text-red-400 mb-1">⚠ Hazard Flags</p>
+                <ul className="text-xs text-red-300 space-y-0.5">
+                  {result.hazard_flags.map((h, i) => <li key={i}>• {h}</li>)}
+                </ul>
+              </div>
+            )}
+            {result.triage_notes && (
+              <p className="text-xs text-slate-400 leading-relaxed italic">{result.triage_notes}</p>
+            )}
+
+            {/* Auto-report confirmation */}
+            {reported && (
+              <div className="rounded-xl border border-purple-700 bg-purple-950/30 px-3 py-2 flex items-center gap-2">
+                <span className="text-purple-400">📡</span>
+                <p className="text-xs font-black text-purple-300">Reported to dispatch</p>
+              </div>
+            )}
+
+            {/* Peer crew summary */}
+            {aggregated && aggregated.report_count > 1 && (
+              <div className="rounded-xl border border-blue-800 bg-blue-950/20 px-3 py-2">
+                <p className="text-xs font-black text-blue-300 mb-1">
+                  {aggregated.report_count} crews have reported from this scene
+                </p>
+                <p className="text-xs text-slate-400">
+                  Combined: {aggregated.total_estimated ?? '?'} estimated
+                  {' · '}Confidence: <span className={
+                    aggregated.confidence === 'HIGH'   ? 'text-green-400' :
+                    aggregated.confidence === 'MEDIUM' ? 'text-amber-400' : 'text-slate-400'
+                  }>{aggregated.confidence}</span>
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {state === 'error' && (
+          <p className="text-xs text-red-400 text-center">Assessment failed — check backend</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 /* ── Main Component ──────────────────────────────────────────────────────────── */
 
 export default function CrewView() {
@@ -179,6 +314,7 @@ export default function CrewView() {
   const [missionDone,  setMissionDone]  = useState(false)        // completion splash
   const [unitId]                        = useState(parseUnitFromHash)
   const clearTimer                      = useRef(null)
+  const hasSpoken                       = useRef(false)
 
   /* GPS — best-effort */
   const [crewPos,  setCrewPos]  = useState(null)
@@ -211,10 +347,25 @@ export default function CrewView() {
   const statusCfg = STATUS_CFG[crewStatus] || STATUS_CFG.dispatched
 
   function applyData(data) {
-    if (!data) { setAssignment(null); setCrewStatus('dispatched'); return }
+    if (!data) {
+      setAssignment(null)
+      setCrewStatus('dispatched')
+      hasSpoken.current = false
+      return
+    }
     setAssignment(data)
     setCrewStatus(data.status || (data.acknowledged_at ? 'en_route' : 'dispatched'))
   }
+
+  // Speak dispatch alert once when assignment first arrives
+  useEffect(() => {
+    if (assignment && !hasSpoken.current) {
+      hasSpoken.current = true
+      // Small delay so page has rendered before speaking
+      const t = setTimeout(() => speakDispatch(assignment, unitCfg?.callsign || unitId), 800)
+      return () => clearTimeout(t)
+    }
+  }, [assignment]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Primary sync: localStorage ─────────────────────────────────────────── */
   useEffect(() => {
@@ -536,6 +687,11 @@ export default function CrewView() {
             {checks.map((item, i) => <CheckItem key={i} text={item} />)}
           </div>
         </div>
+
+        {/* AI Vision scene assessment — shown when crew is on scene */}
+        {crewStatus === 'on_scene' && (
+          <SceneAssessButton unitId={unitId} incidentId={assignment?.incident_id} />
+        )}
 
         {/* AI rationale */}
         {assignment.reason && (

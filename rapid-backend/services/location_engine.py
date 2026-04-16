@@ -13,6 +13,7 @@ Cache uses cachetools.TTLCache so it is safe when Cloud Run scales to multiple
 instances (each instance has its own in-process cache with a 1-hour TTL).
 """
 
+import asyncio
 import logging
 import math
 import httpx
@@ -28,7 +29,7 @@ _cache: TTLCache = TTLCache(maxsize=256, ttl=3600)
 # ── Constants ──────────────────────────────────────────────────────────────────
 OVERPASS_URL        = "https://overpass-api.de/api/interpreter"
 OVERPASS_MIRROR_URL = "https://overpass.kumi.systems/api/interpreter"
-OVERPASS_TIMEOUT    = 15
+OVERPASS_TIMEOUT    = 5   # reduced: both URLs tried in parallel, so worst-case is 5s not 30s
 NOMINATIM_URL       = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_TIMEOUT   = 10
 
@@ -165,33 +166,41 @@ async def discover_agencies(
         f");"
         f"out center;"
     )
-    for url in (OVERPASS_URL, OVERPASS_MIRROR_URL):
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, data={"data": query}, timeout=10)
-                response.raise_for_status()
-            elements = response.json().get("elements", [])
-            agencies = []
-            for element in elements:
-                tags    = element.get("tags", {})
-                name    = tags.get("name") or tags.get("amenity", "Unknown")
-                amenity = tags.get("amenity", "")
-                a_lat   = element.get("lat") or element.get("center", {}).get("lat")
-                a_lon   = element.get("lon") or element.get("center", {}).get("lon")
-                if a_lat is None or a_lon is None:
-                    continue
-                agencies.append({
-                    "id":          f"osm_{element['id']}",
-                    "name":        name,
-                    "type":        "fire_station" if amenity == "fire_station" else "police",
-                    "lat":         a_lat,
-                    "lon":         a_lon,
-                    "distance_km": round(haversine(lat, lon, a_lat, a_lon), 2),
-                })
-            agencies.sort(key=lambda a: a["distance_km"])
-            return agencies[:6]
-        except Exception as exc:
-            logger.warning("Agency discovery failed on %s (%s) — skipping.", url, exc)
+    async def _try_agency_url(url: str):
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, data={"data": query}, timeout=OVERPASS_TIMEOUT)
+            r.raise_for_status()
+        return r.json().get("elements", [])
+
+    results = await asyncio.gather(
+        _try_agency_url(OVERPASS_URL),
+        _try_agency_url(OVERPASS_MIRROR_URL),
+        return_exceptions=True,
+    )
+
+    for outcome in results:
+        if isinstance(outcome, Exception):
+            logger.warning("Agency discovery failed (%s) — skipping.", type(outcome).__name__)
+            continue
+        agencies = []
+        for element in outcome:
+            tags    = element.get("tags", {})
+            name    = tags.get("name") or tags.get("amenity", "Unknown")
+            amenity = tags.get("amenity", "")
+            a_lat   = element.get("lat") or element.get("center", {}).get("lat")
+            a_lon   = element.get("lon") or element.get("center", {}).get("lon")
+            if a_lat is None or a_lon is None:
+                continue
+            agencies.append({
+                "id":          f"osm_{element['id']}",
+                "name":        name,
+                "type":        "fire_station" if amenity == "fire_station" else "police",
+                "lat":         a_lat,
+                "lon":         a_lon,
+                "distance_km": round(haversine(lat, lon, a_lat, a_lon), 2),
+            })
+        agencies.sort(key=lambda a: a["distance_km"])
+        return agencies[:6]
     return []
 
 
@@ -257,24 +266,32 @@ async def _query_overpass(
         f"out center;"
     )
 
-    for url in (OVERPASS_URL, OVERPASS_MIRROR_URL):
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url, data={"data": query}, timeout=OVERPASS_TIMEOUT,
-                )
-                response.raise_for_status()
-            elements = response.json().get("elements", [])
-            hospitals = _parse_elements(elements, lat, lon)
-            hospitals.sort(key=lambda h: h["distance_km"])
-            logger.info(
-                "Overpass (%s) returned %d hospitals within %.0f km of (%.4f, %.4f).",
-                url.split("/")[2], len(hospitals), radius_km, lat, lon,
-            )
-            return hospitals[:MAX_RESULTS]
-        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
-            logger.warning("Overpass %s failed (%s: %s).", url.split("/")[2],
-                           type(exc).__name__, exc)
+    # Query both Overpass endpoints IN PARALLEL — worst case is now 5s, not 30s.
+    async def _try_url(url: str):
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, data={"data": query}, timeout=OVERPASS_TIMEOUT)
+            r.raise_for_status()
+        return url, r.json().get("elements", [])
+
+    results = await asyncio.gather(
+        _try_url(OVERPASS_URL),
+        _try_url(OVERPASS_MIRROR_URL),
+        return_exceptions=True,
+    )
+
+    urls = [OVERPASS_URL, OVERPASS_MIRROR_URL]
+    for i, outcome in enumerate(results):
+        if isinstance(outcome, Exception):
+            logger.warning("Overpass %s failed (%s).", urls[i].split("/")[2], type(outcome).__name__)
+            continue
+        url, elements = outcome
+        hospitals = _parse_elements(elements, lat, lon)
+        hospitals.sort(key=lambda h: h["distance_km"])
+        logger.info(
+            "Overpass (%s) returned %d hospitals within %.0f km of (%.4f, %.4f).",
+            url.split("/")[2], len(hospitals), radius_km, lat, lon,
+        )
+        return hospitals[:MAX_RESULTS]
 
     # Both endpoints failed
     if use_circuit_breaker:

@@ -5,10 +5,12 @@ POST /incident — orchestrates all pipeline layers in sequence:
   Layer 1   location_engine   →  discover nearby hospitals
   Layer 2   aggregator        →  fetch ETA, blood, capacity in parallel
   Layer 3   scorer            →  rank hospitals 0–100
-  Layer 4a  gemini_router     →  AI routing with clinical reasoning (primary)
-  Layer 4b  fallback_router   →  score-based assignment if AI fails (secondary)
+  Layer 4a  groq_router       →  AI routing with clinical reasoning (PRIMARY)
+  Layer 4b  gemini_router     →  AI routing fallback if Groq unavailable
+  Layer 4c  fallback_router   →  deterministic score-based assignment (final fallback)
 
-GET /incidents — return recent incidents from Firestore
+GET /incidents    — return recent incidents from Firestore
+GET /system-status — return current API provider state (circuit breaker status)
 
 The response schema is identical regardless of which routing path is used.
 """
@@ -18,7 +20,8 @@ import json
 import logging
 import time
 import uuid
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, UploadFile, File
+from typing import Optional
 from fastapi.responses import StreamingResponse
 
 from models.schemas import IncidentRequest, IncidentResponse
@@ -27,6 +30,7 @@ from services.aggregator import fetch_hospital_data
 from services.scorer import score_all
 from services import gemini_router, groq_router, fallback_router
 from services import firestore_client
+from services.quota_tracker import quota_tracker
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -41,9 +45,10 @@ async def handle_incident(
     Receive an incident report and return patient routing decisions.
 
     Routing path:
-      1. Gemini AI attempted first (8-second timeout), unless force_fallback=True.
-      2. If Gemini times out, raises an API error, or returns invalid JSON →
-         fallback_router takes over deterministically in <1 second.
+      1. Groq Llama-3.3-70b attempted first (primary AI — large free tier).
+      2. If Groq fails → Gemini 1.5 Flash (fallback AI).
+      3. If both AI tiers fail → deterministic score-based fallback (<1s).
+      force_fallback=True skips both AI tiers.
 
     The response always includes which path was used via decision_path.
     """
@@ -135,6 +140,185 @@ async def list_incidents(limit: int = 10):
     return {"incidents": incidents, "count": len(incidents)}
 
 
+@router.get("/system-status")
+async def system_status():
+    """
+    Return current API provider state for the Financial Circuit Breaker.
+    Frontend reads this on mount to decide which map/search component to render:
+      map_provider:     "google" | "oss"
+      eta_provider:     "google" | "ors"
+      address_provider: "google" | "nominatim"
+    """
+    return quota_tracker.get_status()
+
+
+def _aggregate_reports(reports: list[dict]) -> dict:
+    """Aggregate multiple scene assessment reports into a single summary."""
+    patient_totals: dict[str, int] = {"critical": 0, "moderate": 0, "minor": 0}
+    all_hazards: set[str] = set()
+    casualty_estimates: list[int] = []
+
+    for r in reports:
+        for pg in r.get("patient_groups", []):
+            sev = pg.get("severity", "")
+            if sev in patient_totals:
+                patient_totals[sev] += pg.get("count", 0)
+        all_hazards.update(r.get("hazard_flags", []))
+        if r.get("estimated_casualties") is not None:
+            try:
+                casualty_estimates.append(int(r["estimated_casualties"]))
+            except (TypeError, ValueError):
+                pass
+
+    n = len(reports)
+    confidence = "HIGH" if n >= 3 else "MEDIUM" if n == 2 else "LOW"
+    return {
+        "report_count":    n,
+        "confidence":      confidence,
+        "patient_groups":  [
+            {"severity": k, "count": v, "injury_type": None}
+            for k, v in patient_totals.items()
+            if v > 0
+        ],
+        "total_estimated": round(sum(casualty_estimates) / len(casualty_estimates))
+                           if casualty_estimates else None,
+        "hazard_flags":    sorted(all_hazards),
+        "reports":         reports,
+    }
+
+
+@router.post("/scene-assess")
+async def scene_assess(
+    image:       UploadFile    = File(...),
+    unit_id:     Optional[str] = Form(None),
+    incident_id: Optional[str] = Form(None),
+):
+    """
+    AI Vision Scene Assessment powered by Groq Llama 4 Scout (free tier).
+    Crew uploads a photo of the incident scene; the model analyses it and
+    returns a triage estimate: casualty count, severity split, hazard flags,
+    and structured patient_groups in RAPID format.
+
+    If unit_id + incident_id are provided the report is saved to Firestore and
+    an aggregated cross-crew summary is returned alongside the individual result.
+    """
+    import base64
+    import json
+    import os
+    import re
+    import httpx
+
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
+
+    # Read & encode image
+    raw = await image.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
+
+    mime_type = image.content_type or "image/jpeg"
+    data_url  = f"data:{mime_type};base64,{base64.b64encode(raw).decode()}"
+
+    prompt = (
+        "You are an emergency medical triage AI analysing an incident scene photo. "
+        "Return ONLY valid JSON — no markdown, no preamble:\n"
+        "{\n"
+        '  "estimated_casualties": <integer or null if no people visible>,\n'
+        '  "severity_distribution": "<e.g. 2 critical, 5 moderate, 8 minor> or null",\n'
+        '  "patient_groups": [\n'
+        '    {"severity": "critical", "count": <int>, "injury_type": "<burns|trauma|neuro|null>"},\n'
+        '    {"severity": "moderate", "count": <int>, "injury_type": null},\n'
+        '    {"severity": "minor",    "count": <int>, "injury_type": null}\n'
+        '  ],\n'
+        '  "hazard_flags": ["<hazard1>", "<hazard2>"],\n'
+        '  "triage_notes": "<1-2 sentence clinical summary for the arriving crew>"\n'
+        "}\n"
+        "Always include all three severity levels in patient_groups even if count is 0. "
+        "If no people are visible set estimated_casualties to null and all counts to 0."
+    )
+
+    # Try Llama 4 Scout first (best vision), fall back to Llama 3.2 11B Vision
+    models = [
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "llama-3.2-11b-vision-preview",
+    ]
+
+    body = {
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text",      "text": prompt},
+            ],
+        }],
+        "temperature":     0.1,
+        "max_tokens":      700,
+        "response_format": {"type": "json_object"},
+    }
+
+    last_exc = None
+    for model in models:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={**body, "model": model},
+                )
+            if resp.status_code == 200:
+                raw_text = resp.json()["choices"][0]["message"]["content"]
+                cleaned  = re.sub(r"```.*?\n|```", "", raw_text, flags=re.DOTALL).strip()
+                result   = json.loads(cleaned)
+                result["_model"] = model
+
+                # ── Save to Firestore (background, non-blocking) ──────────────
+                if incident_id and unit_id:
+                    asyncio.create_task(
+                        firestore_client.save_scene_assessment(
+                            incident_id, unit_id, {**result}
+                        )
+                    )
+
+                # ── Build aggregated cross-crew summary ───────────────────────
+                aggregated = None
+                if incident_id:
+                    try:
+                        existing = await firestore_client.get_scene_assessments(incident_id)
+                        # Merge this report (not yet committed) with existing ones
+                        this_report = {**result, "unit_id": unit_id or "unknown"}
+                        all_reports = (
+                            [r for r in existing if r.get("unit_id") != unit_id]
+                            + [this_report]
+                        )
+                        aggregated = _aggregate_reports(all_reports)
+                    except Exception as agg_exc:
+                        logger.warning("Scene aggregation failed: %s", agg_exc)
+
+                result["aggregated"] = aggregated
+                logger.info("Scene assessment via %s succeeded.", model)
+                return result
+
+            logger.warning("Scene assess model %s returned HTTP %d — trying next.", model, resp.status_code)
+            last_exc = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as exc:
+            logger.warning("Scene assess model %s failed: %s", model, exc)
+            last_exc = str(exc)
+
+    logger.error("All vision models failed. Last error: %s", last_exc)
+    raise HTTPException(status_code=502, detail=f"Vision assessment failed: {last_exc}")
+
+
+@router.get("/scene-assessments/{incident_id}")
+async def get_scene_assessments_endpoint(incident_id: str):
+    """
+    Return all scene assessment reports for an incident plus an aggregated summary.
+    Used by DispatcherPanel as a REST fallback when Firestore JS SDK is unavailable.
+    """
+    reports = await firestore_client.get_scene_assessments(incident_id)
+    return {"incident_id": incident_id, "aggregated": _aggregate_reports(reports)}
+
+
 @router.post("/incident/stream")
 async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
     """
@@ -197,7 +381,7 @@ async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
             patient_groups  = [pg.model_dump() for pg in payload.patients]
             total_patients  = sum(pg["count"] for pg in patient_groups)
             ai_label        = ("deterministic scoring engine"
-                               if payload.force_fallback else "Gemini AI (clinical reasoning)")
+                               if payload.force_fallback else "Groq Llama-3.3 (clinical reasoning)")
 
             yield evt({"type": "step", "step": 4, "done": False,
                        "msg": f"Routing {total_patients} patients via {ai_label}..."})
@@ -278,28 +462,34 @@ async def _route(
     force_fallback: bool = False,
 ) -> dict:
     """
-    Routing chain: Gemini → Groq → deterministic fallback.
-    Each tier is tried in order; any failure moves to the next.
-    force_fallback=True skips both AI tiers.
+    Routing chain: Groq (PRIMARY) → Gemini 1.5 Flash (FALLBACK) → deterministic.
+
+    Groq is primary because its free tier (~500K tokens/day) far exceeds
+    Gemini's (~1.5K req/day), eliminating rate-limit risk during live demos.
+    Gemini is preserved as a strong AI fallback and for Vision features.
+    force_fallback=True skips both AI tiers (used by "Simulate AI Failure" toggle).
     """
     if not force_fallback:
-        # ── Tier 1: Gemini ────────────────────────────────────────────────────
-        try:
-            return await gemini_router.route_patients(scores, patient_groups, hospital_data)
-        except asyncio.TimeoutError:
-            logger.warning("Gemini timed out — trying Groq.")
-        except Exception as exc:
-            logger.warning("Gemini unavailable (%s: %s) — trying Groq.", type(exc).__name__, exc)
-
-        # ── Tier 2: Groq ──────────────────────────────────────────────────────
+        # ── Tier 1: Groq (Llama-3.3-70b) — primary AI ────────────────────────
         try:
             result = await groq_router.route_patients(scores, patient_groups, hospital_data)
-            logger.info("Groq routing succeeded.")
+            logger.info("Groq routing succeeded (primary).")
             return result
         except asyncio.TimeoutError:
-            logger.warning("Groq timed out — switching to deterministic fallback.")
+            logger.warning("Groq timed out — trying Gemini fallback.")
         except Exception as exc:
-            logger.warning("Groq unavailable (%s: %s) — switching to deterministic fallback.",
+            logger.warning("Groq unavailable (%s: %s) — trying Gemini fallback.",
+                           type(exc).__name__, exc)
+
+        # ── Tier 2: Gemini 1.5 Flash — AI fallback ───────────────────────────
+        try:
+            result = await gemini_router.route_patients(scores, patient_groups, hospital_data)
+            logger.info("Gemini fallback routing succeeded.")
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("Gemini timed out — switching to deterministic fallback.")
+        except Exception as exc:
+            logger.warning("Gemini unavailable (%s: %s) — switching to deterministic fallback.",
                            type(exc).__name__, exc)
     else:
         logger.info("force_fallback=True — skipping AI tiers.")

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 _API_KEY  = os.getenv("GEMINI_API_KEY", "")
-_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _AI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15.0"))
@@ -137,7 +137,7 @@ async def route_patients(
     if "assignments" not in result:
         raise ValueError("Invalid AI response (missing assignments)")
 
-    result["decision_path"] = "AI"
+    result["decision_path"] = "gemini"
     return result
 
 
