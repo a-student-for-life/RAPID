@@ -1,14 +1,11 @@
-import React from 'react'
+import React, { Suspense, lazy } from 'react'
 import ReactDOM from 'react-dom/client'
 import 'leaflet/dist/leaflet.css'
-import App from './App.jsx'
-import CrewView from './components/CrewView.jsx'
 import './index.css'
 
-/* ── Error Boundary ────────────────────────────────────────────────────────────
-   Prevents the dreaded blank screen. Any render-time crash is caught here and
-   shown as a readable error card instead of white nothing.
-   ──────────────────────────────────────────────────────────────────────────── */
+const App = lazy(() => import('./App.jsx'))
+const CrewView = lazy(() => import('./components/CrewView.jsx'))
+
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props)
@@ -34,7 +31,7 @@ class ErrorBoundary extends React.Component {
         }}>
           <p style={{ fontSize: '2.5rem', marginBottom: '1rem' }}>🚨</p>
           <p style={{ fontSize: '1.1rem', fontWeight: 900, marginBottom: '0.5rem', color: '#f87171' }}>
-            RAPID — Unexpected Error
+            RAPID - Unexpected Error
           </p>
           <p style={{
             fontSize: '0.8rem', color: '#94a3b8', maxWidth: '480px',
@@ -61,13 +58,22 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-/* ── Hash-based routing ────────────────────────────────────────────────────── */
 const isCrewView = window.location.hash.startsWith('#crew')
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/rapid-sw.js').catch((error) => {
+      console.warn('[RAPID] Service worker registration failed:', error?.message || error)
+    })
+  })
+}
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <ErrorBoundary>
-      {isCrewView ? <CrewView /> : <App />}
+      <Suspense fallback={<div className="min-h-screen grid place-items-center bg-[#080a0f] text-sm text-slate-500">Loading RAPID...</div>}>
+        {isCrewView ? <CrewView /> : <App />}
+      </Suspense>
     </ErrorBoundary>
   </React.StrictMode>,
 )

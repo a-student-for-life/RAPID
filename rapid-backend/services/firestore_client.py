@@ -21,6 +21,13 @@ _init_attempted   = False
 _firebase_admin   = None
 _fcm_initialized  = False
 
+_ACTIVE_INCIDENT_STATUS_RANK = {
+    "dispatched": 1,
+    "en_route": 2,
+    "on_scene": 3,
+    "transporting": 4,
+}
+
 
 def disable() -> None:
     """Proactively disable Firestore (called when Google is unreachable at startup).
@@ -32,6 +39,38 @@ def disable() -> None:
 
 
 # ── Firestore ──────────────────────────────────────────────────────────────────
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _default_incident_doc() -> dict[str, Any]:
+    now = _utc_now_iso()
+    return {
+        "status": "new",
+        "crew_statuses": {},
+        "prealerts": [],
+        "reroutes": [],
+        "timeline": [],
+        "saved_at": now,
+        "updated_at": now,
+    }
+
+
+def _append_timeline_event(doc: dict[str, Any], event: dict[str, Any]) -> None:
+    timeline = list(doc.get("timeline", []))
+    timeline.append(event)
+    doc["timeline"] = timeline[-100:]
+
+
+def _derive_incident_status(crew_statuses: dict[str, str], fallback: str = "new") -> str:
+    active = [status for status in crew_statuses.values() if status not in {"closed", "standby"}]
+    if active:
+        return max(active, key=lambda status: _ACTIVE_INCIDENT_STATUS_RANK.get(status, 0))
+    if crew_statuses:
+        return "closed"
+    return fallback
+
 
 def _get_db():
     global _db, _init_attempted
@@ -64,22 +103,56 @@ def _get_db():
     return _db
 
 
-async def save_incident(incident_id: str, data: dict[str, Any]) -> None:
-    """Write an incident document to Firestore. Silent no-op on any failure."""
+async def _mutate_incident(
+    incident_id: str,
+    mutator,
+    *,
+    missing_ok: bool = True,
+) -> None:
     db = _get_db()
     if db is None:
         return
     try:
-        doc = {
-            **data,
-            "hospitals": data.get("hospitals", []),
-            "scores":    data.get("scores", []),
-            "saved_at":  datetime.now(timezone.utc).isoformat(),
-        }
-        await db.collection("incidents").document(incident_id).set(doc)
-        logger.info("Incident %s persisted to Firestore.", incident_id)
+        ref = db.collection("incidents").document(incident_id)
+        snap = await ref.get()
+        if snap.exists:
+            doc = {**_default_incident_doc(), **snap.to_dict()}
+        elif missing_ok:
+            doc = _default_incident_doc()
+        else:
+            return
+
+        mutator(doc)
+        doc["updated_at"] = _utc_now_iso()
+        await ref.set(doc)
     except Exception as exc:
-        logger.warning("Firestore write failed for %s: %s", incident_id, exc)
+        logger.warning("Firestore incident mutation failed for %s: %s", incident_id, exc)
+
+
+async def save_incident(incident_id: str, data: dict[str, Any]) -> None:
+    """Write an incident document to Firestore. Silent no-op on any failure."""
+    def _save(doc: dict[str, Any]) -> None:
+        timeline = list(doc.get("timeline", []))
+        if not timeline:
+            timeline.append({
+                "event": "incident_created",
+                "timestamp": _utc_now_iso(),
+            })
+
+        doc.update({
+            **data,
+            "hospitals": data.get("hospitals", doc.get("hospitals", [])),
+            "scores": data.get("scores", doc.get("scores", [])),
+            "status": doc.get("status", data.get("status", "new")),
+            "timeline": timeline[-100:],
+            "crew_statuses": dict(doc.get("crew_statuses", {})),
+            "prealerts": list(doc.get("prealerts", [])),
+            "reroutes": list(doc.get("reroutes", [])),
+            "saved_at": doc.get("saved_at") or _utc_now_iso(),
+        })
+
+    await _mutate_incident(incident_id, _save)
+    logger.info("Incident %s persisted to Firestore.", incident_id)
 
 
 async def get_incident(incident_id: str) -> dict[str, Any] | None:
@@ -133,13 +206,146 @@ async def save_crew_assignment(unit_id: str, data: dict[str, Any]) -> None:
     try:
         doc = {
             **data,
-            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            "dispatched_at": _utc_now_iso(),
             "status":        "dispatched",
+            "updated_at":    _utc_now_iso(),
         }
         await db.collection("crew_assignments").document(unit_id).set(doc)
         logger.info("Crew assignment saved for unit %s.", unit_id)
     except Exception as exc:
         logger.warning("Firestore crew assignment write failed for %s: %s", unit_id, exc)
+
+
+async def update_crew_assignment(unit_id: str, patch: dict[str, Any]) -> None:
+    """Merge a patch into an existing crew assignment."""
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        ref = db.collection("crew_assignments").document(unit_id)
+        snap = await ref.get()
+        base = snap.to_dict() if snap.exists else {}
+        await ref.set({**base, **patch, "updated_at": _utc_now_iso()})
+        logger.info("Crew assignment updated for unit %s.", unit_id)
+    except Exception as exc:
+        logger.warning("Firestore crew assignment update failed for %s: %s", unit_id, exc)
+
+
+async def record_incident_dispatch(incident_id: str, unit_id: str, assignment: dict[str, Any]) -> None:
+    """Append a dispatch event and mark the incident active."""
+    if not incident_id:
+        return
+
+    def _mutate(doc: dict[str, Any]) -> None:
+        crew_statuses = dict(doc.get("crew_statuses", {}))
+        crew_statuses[unit_id] = "dispatched"
+        doc["crew_statuses"] = crew_statuses
+        doc["status"] = _derive_incident_status(crew_statuses, fallback=doc.get("status", "new"))
+        _append_timeline_event(doc, {
+            "event": "crew_dispatched",
+            "timestamp": _utc_now_iso(),
+            "unit_id": unit_id,
+            "hospital_name": assignment.get("hospital_name"),
+            "severity": assignment.get("severity"),
+            "patients_assigned": assignment.get("patients_assigned"),
+        })
+
+    await _mutate_incident(incident_id, _mutate)
+
+
+async def record_crew_status(
+    incident_id: str,
+    unit_id: str,
+    status: str,
+    *,
+    notes: str = "",
+    timestamp: str | None = None,
+) -> None:
+    """Persist a crew status transition onto the incident timeline."""
+    if not incident_id:
+        return
+
+    def _mutate(doc: dict[str, Any]) -> None:
+        crew_statuses = dict(doc.get("crew_statuses", {}))
+        crew_statuses[unit_id] = status
+        doc["crew_statuses"] = crew_statuses
+        doc["status"] = _derive_incident_status(crew_statuses, fallback=doc.get("status", "new"))
+        _append_timeline_event(doc, {
+            "event": "crew_status",
+            "timestamp": timestamp or _utc_now_iso(),
+            "unit_id": unit_id,
+            "status": status,
+            "notes": notes,
+        })
+
+    await _mutate_incident(incident_id, _mutate)
+
+
+async def record_hospital_prealert(
+    incident_id: str,
+    hospital_id: str,
+    prealert: dict[str, Any],
+) -> None:
+    """Store a hospital pre-alert against an incident."""
+    if not incident_id:
+        return
+
+    def _mutate(doc: dict[str, Any]) -> None:
+        entry = {
+            **prealert,
+            "hospital_id": hospital_id,
+            "timestamp": prealert.get("timestamp") or _utc_now_iso(),
+        }
+        prealerts = list(doc.get("prealerts", []))
+        prealerts.append(entry)
+        doc["prealerts"] = prealerts[-50:]
+        _append_timeline_event(doc, {
+            "event": "hospital_prealert",
+            "timestamp": entry["timestamp"],
+            "hospital_id": hospital_id,
+            "hospital_name": prealert.get("hospital_name"),
+            "severity": prealert.get("severity"),
+            "patients_assigned": prealert.get("patients_assigned"),
+        })
+
+    await _mutate_incident(incident_id, _mutate)
+
+
+async def record_incident_reroute(
+    incident_id: str,
+    reroute: dict[str, Any],
+    incident_snapshot: dict[str, Any],
+) -> None:
+    """Append reroute history while replacing the current incident snapshot."""
+    if not incident_id:
+        return
+
+    def _mutate(doc: dict[str, Any]) -> None:
+        reroute_entry = {
+            **reroute,
+            "timestamp": reroute.get("timestamp") or _utc_now_iso(),
+        }
+        reroutes = list(doc.get("reroutes", []))
+        reroutes.append(reroute_entry)
+        doc["reroutes"] = reroutes[-20:]
+        doc.update({
+            **incident_snapshot,
+            "saved_at": doc.get("saved_at") or _utc_now_iso(),
+            "crew_statuses": dict(doc.get("crew_statuses", {})),
+            "prealerts": list(doc.get("prealerts", [])),
+            "timeline": list(doc.get("timeline", [])),
+            "reroutes": reroutes[-20:],
+            "status": doc.get("status", "new"),
+        })
+        _append_timeline_event(doc, {
+            "event": "incident_rerouted",
+            "timestamp": reroute_entry["timestamp"],
+            "source": reroute.get("source", "scene_consensus"),
+            "reason": reroute.get("reason", ""),
+            "report_count": reroute.get("report_count"),
+        })
+
+    await _mutate_incident(incident_id, _mutate)
 
 
 # ── FCM push notifications ─────────────────────────────────────────────────────
@@ -181,7 +387,7 @@ async def save_scene_assessment(incident_id: str, unit_id: str, data: dict[str, 
             **data,
             "unit_id":     unit_id,
             "incident_id": incident_id,
-            "saved_at":    datetime.now(timezone.utc).isoformat(),
+            "saved_at":    _utc_now_iso(),
         }
         await (
             db.collection("scene_assessments")

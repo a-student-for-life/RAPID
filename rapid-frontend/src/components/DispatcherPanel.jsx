@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react'
 import axios from 'axios'
 import { getContact } from '../hospitalContacts.js'
+import { getConsensusPatientGroups } from '../lib/sceneIntel.js'
+import { recommendUnitForAssignment } from '../lib/unitRecommendation.js'
 
 /* ── Firestore imports (guarded) ─────────────────────────────────────────────
    All usage is wrapped in try/catch so a mis-configured Firestore never crashes.
@@ -58,68 +60,104 @@ function useCrewDoc(unitId) {
   return data
 }
 
+function readUnitDocsSnapshot() {
+  const snapshot = {}
+  UNITS.forEach((unitId) => {
+    try {
+      const raw = localStorage.getItem(LS_KEY(unitId))
+      snapshot[unitId] = activeOrNull(raw ? JSON.parse(raw) : null)
+    } catch {
+      snapshot[unitId] = null
+    }
+  })
+  return snapshot
+}
+
+function useUnitDocsSnapshot() {
+  const [unitDocs, setUnitDocs] = useState(readUnitDocsSnapshot)
+
+  useEffect(() => {
+    function refreshFromStorage() {
+      setUnitDocs(readUnitDocsSnapshot())
+    }
+
+    window.addEventListener('storage', refreshFromStorage)
+
+    const unsubs = []
+    if (db) {
+      try {
+        UNITS.forEach((unitId) => {
+          const ref = doc(db, 'crew_assignments', unitId)
+          const unsub = onSnapshot(
+            ref,
+            (snap) => {
+              setUnitDocs(prev => ({
+                ...prev,
+                [unitId]: snap.exists() ? activeOrNull(snap.data()) : null,
+              }))
+            },
+            () => {},
+          )
+          unsubs.push(unsub)
+        })
+      } catch {}
+    }
+
+    return () => {
+      window.removeEventListener('storage', refreshFromStorage)
+      unsubs.forEach((unsub) => {
+        try { unsub?.() } catch {}
+      })
+    }
+  }, [])
+
+  function upsertUnitDoc(unitId, data) {
+    setUnitDocs(prev => ({ ...prev, [unitId]: activeOrNull(data) }))
+  }
+
+  return { unitDocs, upsertUnitDoc }
+}
+
 /* ── Scene Intelligence hook ─────────────────────────────────────────────────── */
 
 function useSceneReports(incidentId) {
   const [reports,    setReports]    = useState([])
   const [aggregated, setAggregated] = useState(null)
 
-  function aggregateLocal(rpts) {
-    const totals  = { critical: 0, moderate: 0, minor: 0 }
-    const hazards = new Set()
-    const casualties = []
-    for (const r of rpts) {
-      for (const pg of (r.patient_groups || [])) {
-        if (totals[pg.severity] !== undefined) totals[pg.severity] += (pg.count || 0)
-      }
-      for (const h of (r.hazard_flags || [])) hazards.add(h)
-      if (r.estimated_casualties != null) casualties.push(Number(r.estimated_casualties))
-    }
-    const n = rpts.length
-    return {
-      report_count:    n,
-      confidence:      n >= 3 ? 'HIGH' : n === 2 ? 'MEDIUM' : n > 0 ? 'LOW' : null,
-      patient_groups:  Object.entries(totals)
-                             .filter(([, v]) => v > 0)
-                             .map(([k, v]) => ({ severity: k, count: v, injury_type: null })),
-      total_estimated: casualties.length
-                       ? Math.round(casualties.reduce((a, b) => a + b, 0) / casualties.length)
-                       : null,
-      hazard_flags:    [...hazards].sort(),
-      reports:         rpts,
-    }
-  }
-
   useEffect(() => {
-    if (!incidentId) return
+    if (!incidentId) {
+      setReports([])
+      setAggregated(null)
+      return
+    }
     let unsub
     let pollInterval
+
+    async function refreshAggregate() {
+      try {
+        const res = await fetch(`/api/scene-assessments/${incidentId}`)
+        if (!res.ok) return
+        const data = await res.json()
+        setAggregated(data.aggregated || null)
+        setReports(data.raw_reports || data.aggregated?.raw_reports || [])
+      } catch {}
+    }
 
     function startPolling() {
       if (pollInterval) return
       pollInterval = setInterval(async () => {
-        try {
-          const res = await fetch(`/api/scene-assessments/${incidentId}`)
-          if (!res.ok) return
-          const data = await res.json()
-          if (data.aggregated) {
-            setAggregated(data.aggregated)
-            setReports(data.aggregated.reports || [])
-          }
-        } catch {}
+        await refreshAggregate()
       }, 5000)
     }
+
+    refreshAggregate()
 
     if (db) {
       try {
         const ref = collection(db, 'scene_assessments', incidentId, 'reports')
         unsub = onSnapshot(
           ref,
-          (snap) => {
-            const rpts = snap.docs.map(d => ({ ...d.data(), id: d.id }))
-            setReports(rpts)
-            setAggregated(aggregateLocal(rpts))
-          },
+          () => { refreshAggregate() },
           () => { startPolling() },
         )
       } catch {
@@ -161,23 +199,40 @@ const SEV_CFG = {
 function CrewStatusRow({ unitId }) {
   const data = useCrewDoc(unitId)
   const uc   = UNIT_CFG[unitId] || { callsign: unitId }
-  const ackd = !!data?.acknowledged_at
-  const live = !!data
+  const status = data?.status || 'standby'
+  const live = !!data && status !== 'standby'
+  const label = status === 'transporting'
+    ? 'TRANSPORT'
+    : status === 'on_scene'
+    ? 'ON SCENE'
+    : status === 'en_route'
+    ? 'EN ROUTE'
+    : status === 'dispatched'
+    ? 'DISPATCHED'
+    : 'STANDBY'
   return (
     <div className={`flex items-center gap-2.5 px-3 py-2 rounded-lg border text-xs transition-all duration-300 ${
-      ackd ? 'bg-green-950/30 border-green-800' :
-      live ? 'bg-blue-950/30 border-blue-800'   : 'border-transparent'
+      status === 'transporting' ? 'bg-purple-950/30 border-purple-800' :
+      status === 'on_scene' ? 'bg-orange-950/30 border-orange-800' :
+      status === 'en_route' ? 'bg-green-950/30 border-green-800' :
+      live ? 'bg-blue-950/30 border-blue-800' : 'border-transparent'
     }`}>
       <span className={`w-2 h-2 rounded-full shrink-0 ${
-        ackd ? 'bg-green-500' : live ? 'bg-blue-500 animate-pulse' : 'bg-slate-700'
+        status === 'transporting' ? 'bg-purple-500 animate-pulse' :
+        status === 'on_scene' ? 'bg-orange-500 animate-pulse' :
+        status === 'en_route' ? 'bg-green-500' :
+        live ? 'bg-blue-500 animate-pulse' : 'bg-slate-700'
       }`} />
-      <span className={`font-black ${ackd ? 'text-green-400' : live ? 'text-blue-400' : 'text-slate-600'}`}>
+      <span className={`font-black ${
+        status === 'transporting' ? 'text-purple-400' :
+        status === 'on_scene' ? 'text-orange-400' :
+        status === 'en_route' ? 'text-green-400' :
+        live ? 'text-blue-400' : 'text-slate-600'
+      }`}>
         {uc.callsign}
       </span>
       <span className="ml-auto font-bold text-xs">
-        {ackd ? <span className="text-green-400">EN ROUTE</span>
-               : live ? <span className="text-blue-400">DISPATCHED</span>
-                      : <span className="text-slate-700">STANDBY</span>}
+        {live ? <span className="text-inherit">{label}</span> : <span className="text-slate-700">STANDBY</span>}
       </span>
     </div>
   )
@@ -186,17 +241,22 @@ function CrewStatusRow({ unitId }) {
 function CrewAckBar({ unitId }) {
   const data = useCrewDoc(unitId)
   if (!data) return null
-  const ackd = !!data.acknowledged_at
+  const status = data.status || 'dispatched'
+  const isConfirmed = ['en_route', 'on_scene', 'transporting'].includes(status)
   return (
     <div className={`flex items-center gap-2 mt-2 px-3 py-2 rounded-lg border text-xs transition-all ${
-      ackd ? 'bg-green-950/50 border-green-700 text-green-400'
-           : 'bg-blue-950/40 border-blue-800 text-blue-400'
+      isConfirmed ? 'bg-green-950/50 border-green-700 text-green-400'
+        : 'bg-blue-950/40 border-blue-800 text-blue-400'
     }`}>
-      <span className={`w-2 h-2 rounded-full shrink-0 ${ackd ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
+      <span className={`w-2 h-2 rounded-full shrink-0 ${isConfirmed ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
       <span className="font-bold">{UNIT_CFG[unitId]?.callsign || unitId}</span>
       <span className="text-slate-500 mx-1">·</span>
       <span>
-        {ackd
+        {status === 'transporting'
+          ? 'Transporting to destination'
+          : status === 'on_scene'
+          ? 'On scene'
+          : status === 'en_route'
           ? `En Route — ack'd ${new Date(data.acknowledged_at).toLocaleTimeString()}`
           : 'Delivered — awaiting crew acknowledgement'}
       </span>
@@ -226,18 +286,27 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
   const [dispatched,   setDispatched]   = useState(null)
   const [dispatchedAt, setDispatchedAt] = useState(null)
   const [sending,      setSending]      = useState(false)
+  const [prealerting,  setPrealerting]  = useState(false)
+  const [prealerted,   setPrealerted]   = useState(false)
   const [error,        setError]        = useState(null)
+  const { unitDocs, upsertUnitDoc } = useUnitDocsSnapshot()
 
   const countdown = useCountdown(hospital?.eta_minutes, dispatchedAt)
 
   const contact = getContact(hospital?.name || assignment?.hospital || '')
   const sev     = SEV_CFG[assignment?.severity] || SEV_CFG.minor
+  const recommendation = recommendUnitForAssignment(assignment, unitDocs)
+
+  useEffect(() => {
+    if (!dispatched && recommendation?.unitId) setSelectedUnit(recommendation.unitId)
+  }, [dispatched, recommendation?.unitId])
 
   async function handleDispatch() {
     setSending(true)
     setError(null)
+    setPrealerted(false)
     try {
-      await axios.post('/api/crew/dispatch', {
+      const dispatchPayload = {
         unit_id:           selectedUnit,
         incident_id:       incidentId  || '',
         hospital_name:     assignment?.hospital  || '',
@@ -255,7 +324,9 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
         specialties:       Array.isArray(hospital?.specialties) ? hospital.specialties : [],
         phone:             contact?.phone ?? null,
         area:              contact?.area  ?? null,
-      })
+      }
+
+      await axios.post('/api/crew/dispatch', dispatchPayload)
       setDispatched(selectedUnit)
       setDispatchedAt(Date.now())
 
@@ -276,7 +347,7 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
 
       // Write to localStorage — cross-tab sync for crew views (works even without Firestore)
       try {
-        localStorage.setItem(LS_KEY(selectedUnit), JSON.stringify({
+        const crewDoc = {
           unit_id:           selectedUnit,
           incident_id:       incidentId  || '',
           hospital_name:     assignment?.hospital  || '',
@@ -295,7 +366,9 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
           area:              contact?.area  ?? null,
           dispatched_at:     new Date().toISOString(),
           status:            'dispatched',
-        }))
+        }
+        localStorage.setItem(LS_KEY(selectedUnit), JSON.stringify(crewDoc))
+        upsertUnitDoc(selectedUnit, crewDoc)
       } catch {}
     } catch (err) {
       setError(
@@ -305,6 +378,34 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
       )
     } finally {
       setSending(false)
+    }
+  }
+
+  async function handlePrealert() {
+    if (!hospital?.id || !incidentId) return
+    setPrealerting(true)
+    setError(null)
+    try {
+      await axios.post(`/api/hospitals/${encodeURIComponent(hospital.id)}/prealert`, {
+        incident_id: incidentId,
+        hospital_name: assignment?.hospital || '',
+        unit_id: dispatched || recommendation?.unitId || null,
+        eta_minutes: hospital?.eta_minutes ?? null,
+        severity: assignment?.severity || null,
+        patients_assigned: assignment?.patients_assigned ?? null,
+        note: dispatched
+          ? `Crew ${UNIT_CFG[dispatched]?.callsign || dispatched} assigned.`
+          : 'Pre-alert sent before crew assignment.',
+      })
+      setPrealerted(true)
+    } catch (err) {
+      setError(
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Hospital pre-alert failed.'
+      )
+    } finally {
+      setPrealerting(false)
     }
   }
 
@@ -378,10 +479,16 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
           <p className="text-xs text-slate-600 uppercase tracking-widest font-semibold mb-2">
             Assign unit
           </p>
+          {recommendation?.reason && (
+            <p className="text-[11px] text-blue-300 mb-2 leading-snug">
+              Recommended: {UNIT_CFG[recommendation.unitId]?.callsign || recommendation.unitId} — {recommendation.reason}
+            </p>
+          )}
           <div className="flex flex-wrap gap-2">
             {UNITS.map(unit => {
               const uc     = UNIT_CFG[unit]
               const active = selectedUnit === unit
+              const unavailable = !!unitDocs[unit]
               return (
                 <button
                   key={unit}
@@ -389,9 +496,13 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
                   onClick={() => setSelectedUnit(unit)}
                   className={`px-3 py-1.5 rounded-lg text-xs font-black border transition-all ${
                     active ? uc.sel + ' shadow-lg' : uc.idle
-                  }`}
+                  } ${unavailable ? 'opacity-50' : ''}`}
+                  title={unavailable ? `${uc.callsign} currently ${unitDocs[unit]?.status}` : ''}
                 >
                   {uc.callsign}
+                  {recommendation?.unitId === unit && (
+                    <span className="ml-1 text-[10px] text-white/80">REC</span>
+                  )}
                 </button>
               )
             })}
@@ -456,6 +567,19 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
         </button>
       )}
 
+      <button
+        type="button"
+        onClick={handlePrealert}
+        disabled={!incidentId || !hospital?.id || prealerting}
+        className={`w-full mt-3 py-2.5 rounded-xl border text-xs font-black transition-all ${
+          prealerted
+            ? 'border-green-700 bg-green-950/30 text-green-300'
+            : 'border-purple-800 bg-purple-950/20 text-purple-300 hover:bg-purple-900/30'
+        } disabled:opacity-40`}
+      >
+        {prealerting ? 'Sending pre-alert...' : prealerted ? 'PRE-ALERT RECORDED' : 'PRE-ALERT HOSPITAL'}
+      </button>
+
       {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
     </div>
   )
@@ -467,7 +591,6 @@ export default function DispatcherPanel({ result, hospitalMap, incidentLocation,
   if (!result) return null
 
   const assignments   = result.assignments  || []
-  const hospitals     = result.hospitals    || []
   const totalPatients = assignments.reduce((s, a) => s + (a.patients_assigned ?? 0), 0)
   const criticalCount = assignments.filter(a => a.severity === 'critical')
                                    .reduce((s, a) => s + (a.patients_assigned ?? 0), 0)
@@ -480,8 +603,7 @@ export default function DispatcherPanel({ result, hospitalMap, incidentLocation,
   const incLon = incidentLocation?.lon ?? null
 
   const incidentId = result?.incident_id || null
-  // eslint-disable-next-line no-unused-vars
-  const { reports: sceneReports, aggregated: sceneAggregated } = useSceneReports(incidentId)
+  const { aggregated: sceneAggregated } = useSceneReports(incidentId)
 
   function openAllCrewViews() {
     let blocked = 0
@@ -604,10 +726,10 @@ export default function DispatcherPanel({ result, hospitalMap, incidentLocation,
               </p>
             </div>
 
-            {sceneAggregated.patient_groups?.length > 0 && (
+            {getConsensusPatientGroups(sceneAggregated)?.length > 0 && (
               <div className="grid grid-cols-3 gap-2 mb-3">
                 {['critical', 'moderate', 'minor'].map(sev => {
-                  const pg = sceneAggregated.patient_groups.find(p => p.severity === sev)
+                  const pg = getConsensusPatientGroups(sceneAggregated).find(p => p.severity === sev)
                   return (
                     <div key={sev} className={`rounded-xl border p-2 text-center ${
                       sev === 'critical' ? 'border-red-900 bg-red-950/40' :
@@ -632,10 +754,10 @@ export default function DispatcherPanel({ result, hospitalMap, incidentLocation,
               </div>
             )}
 
-            {onRerunWithSceneData && sceneAggregated.patient_groups?.length > 0 && (
+            {onRerunWithSceneData && getConsensusPatientGroups(sceneAggregated)?.length > 0 && (
               <button
                 type="button"
-                onClick={() => onRerunWithSceneData(sceneAggregated.patient_groups, incLat, incLon)}
+                onClick={() => onRerunWithSceneData(sceneAggregated, incLat, incLon)}
                 className="w-full py-3 rounded-xl bg-purple-700 hover:bg-purple-600 active:bg-purple-800
                            text-white text-xs font-black transition-all shadow-lg shadow-purple-900/30"
               >

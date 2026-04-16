@@ -27,7 +27,7 @@ class IncidentRequest(BaseModel):
     patients:       list[PatientGroup]
     force_fallback: bool               = Field(
         False,
-        description="Set true to bypass Gemini and use deterministic fallback (demo/testing).",
+        description="Set true to bypass both AI tiers and use deterministic fallback (demo/testing).",
     )
 
 
@@ -36,6 +36,7 @@ class IncidentRequest(BaseModel):
 class IncidentResponse(BaseModel):
     incident_id:   str
     decision_path: str
+    status:        str = "new"
     hospitals:     list[dict[str, Any]]
     scores:        list[dict[str, Any]]
     assignments:   list[dict[str, Any]]

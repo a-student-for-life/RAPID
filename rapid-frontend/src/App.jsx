@@ -1,6 +1,5 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react'
+import React, { lazy, Suspense, useEffect, useRef, useState, useCallback } from 'react'
 
-import RapidMap          from './components/Map.jsx'
 import IncidentForm      from './components/IncidentForm.jsx'
 import HospitalCard      from './components/HospitalCard.jsx'
 import AIReasoningPanel  from './components/AIReasoningPanel.jsx'
@@ -10,9 +9,13 @@ import DispatchFeed      from './components/DispatchFeed.jsx'
 import MCIBanner         from './components/MCIBanner.jsx'
 import GoldenHourBanner  from './components/GoldenHourBanner.jsx'
 import SDGWidget         from './components/SDGWidget.jsx'
-import DispatcherPanel   from './components/DispatcherPanel.jsx'
-import ComparisonPanel   from './components/ComparisonPanel.jsx'
 import { DEMO_SCENARIO } from './demoScenario.js'
+import { AUTO_DEMO_ENABLED } from './lib/appConfig.js'
+import { buildRerouteConfirmationMessage, getConsensusPatientGroups } from './lib/sceneIntel.js'
+
+const RapidMap = lazy(() => import('./components/Map.jsx'))
+const DispatcherPanel = lazy(() => import('./components/DispatcherPanel.jsx'))
+const ComparisonPanel = lazy(() => import('./components/ComparisonPanel.jsx'))
 
 const DEFAULT_SDG_STATS = { totalPatients: 0, totalCritical: 0, totalDispatches: 0, totalElapsedMs: 0 }
 
@@ -70,7 +73,7 @@ export default function App() {
         const res = await fetch(`/api/scene-assessments/${id}`)
         if (!res.ok) return
         const data = await res.json()
-        if (data.aggregated?.report_count > 0) setSceneIntel(data.aggregated)
+        setSceneIntel(data.aggregated?.report_count > 0 ? data.aggregated : null)
       } catch {}
     }
 
@@ -81,7 +84,7 @@ export default function App() {
 
   /* ── Auto-demo: load Kurla scenario + dispatch after 1.5s ───────────────── */
   useEffect(() => {
-    if (autoRan.current) return
+    if (!AUTO_DEMO_ENABLED || autoRan.current) return
     autoRan.current = true
     setDemoValues(DEMO_SCENARIO)
     const timer = setTimeout(() => {
@@ -204,17 +207,64 @@ export default function App() {
     // sdgStats intentionally NOT reset — accumulates across session
   }
 
-  function handleRerunWithSceneData(patientGroups, lat, lon) {
+  async function handleRerunWithSceneData(sceneSummary, lat, lon) {
     const sceneLat = lat ?? incident?.lat
     const sceneLon = lon ?? incident?.lon
-    if (!sceneLat || !sceneLon) return
+    if (!sceneLat || !sceneLon || !result?.incident_id) return
+
+    const patientGroups = getConsensusPatientGroups(sceneSummary)
     const patients = patientGroups
       .filter(pg => pg.count > 0)
       .map(pg => ({ severity: pg.severity, count: pg.count, injury_type: pg.injury_type ?? null }))
     if (!patients.length) return
-    setDemoValues({ lat: sceneLat, lon: sceneLon, patients })
-    setShowDispatcher(false)
-    handleSubmit({ lat: sceneLat, lon: sceneLon, patients })
+    setPendingTotal(patients.reduce((sum, patient) => sum + patient.count, 0))
+    setPendingTypes([...new Set(patients.map(patient => patient.injury_type).filter(Boolean))])
+
+    const confirmed = window.confirm(
+      buildRerouteConfirmationMessage(sceneSummary, result?.assignments || []),
+    )
+    if (!confirmed) return
+
+    setLoading(true)
+    setError(null)
+    setDispatchDone(false)
+    setStreamLogs([{ type: 'step', step: 1, done: false, msg: 'Re-routing from confirmed scene reports...' }])
+
+    try {
+      const response = await fetch(`/api/incidents/${result.incident_id}/reroute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lat: sceneLat,
+          lon: sceneLon,
+          patients,
+          force_fallback: forceFallback,
+          confirm_consensus: true,
+          source: 'scene_consensus',
+          reason: 'Dispatcher confirmed reroute from crew scene reports.',
+          report_count: sceneSummary?.report_count ?? null,
+        }),
+      })
+
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(text || `Server error ${response.status}`)
+      }
+
+      const data = await response.json()
+      setIncident({ lat: sceneLat, lon: sceneLon })
+      setDemoValues({ lat: sceneLat, lon: sceneLon, patients })
+      setResult(data)
+      setElapsed(Number(data.elapsed_s || 0).toFixed(2))
+      setDispatchDone(true)
+      setShowDispatcher(false)
+      setHistRefresh(n => n + 1)
+      setStreamLogs([{ type: 'step', step: 1, done: true, msg: 'Reroute complete from confirmed scene reports.' }])
+    } catch (err) {
+      setError(err.message || 'Reroute failed')
+    } finally {
+      setLoading(false)
+    }
   }
 
   async function handleCompare() {
@@ -286,6 +336,7 @@ export default function App() {
       })()
     : false
   const showMCI = isMCI || preMCI
+  const sceneConsensusGroups = getConsensusPatientGroups(sceneIntel)
 
   return (
     <div className="flex flex-col h-screen bg-rapid-bg text-slate-200 overflow-hidden">
@@ -417,7 +468,9 @@ export default function App() {
             className={`flex-1 relative transition-all duration-700 ${showMCI ? 'mci-map-pulse' : ''}`}
             style={{ minHeight: 0 }}
           >
-            <RapidMap incident={incident} result={result} onLocationSelect={handleLocationSelect} />
+            <Suspense fallback={<div className="absolute inset-0 grid place-items-center text-sm text-slate-500">Loading map...</div>}>
+              <RapidMap incident={incident} result={result} onLocationSelect={handleLocationSelect} />
+            </Suspense>
 
             {loading && (
               <DispatchFeed
@@ -465,8 +518,8 @@ export default function App() {
 
                   {/* Original → Scene comparison */}
                   <div className="flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
-                    {['critical', 'moderate', 'minor'].map(sev => {
-                      const scenePg  = sceneIntel.patient_groups?.find(p => p.severity === sev)
+                      {['critical', 'moderate', 'minor'].map(sev => {
+                        const scenePg  = sceneConsensusGroups?.find(p => p.severity === sev)
                       const sceneN   = scenePg?.count ?? 0
                       const origN    = origByType[sev] ?? 0
                       const delta    = sceneN - origN
@@ -496,7 +549,7 @@ export default function App() {
 
                   {/* Rerun button */}
                   <button
-                    onClick={() => handleRerunWithSceneData(sceneIntel.patient_groups, incident?.lat, incident?.lon)}
+                    onClick={() => handleRerunWithSceneData(sceneIntel, incident?.lat, incident?.lon)}
                     className="shrink-0 px-3 py-1.5 rounded-lg bg-purple-700 hover:bg-purple-600 active:bg-purple-800
                                text-white text-xs font-black transition-all shadow shadow-purple-900/40 whitespace-nowrap"
                   >
@@ -506,8 +559,8 @@ export default function App() {
 
                 {/* Explanation line */}
                 <p className="text-[10px] text-slate-600 mt-1 leading-tight">
-                  Routing used estimated counts. Crews confirmed different numbers on scene.
-                  Click RERUN to re-dispatch with confirmed data.
+                  Routing used estimated counts. Re-routing now requires explicit dispatcher confirmation
+                  before applying the cross-crew consensus.
                 </p>
               </div>
             )
@@ -548,23 +601,27 @@ export default function App() {
 
       {/* Dispatcher / Command Center */}
       {showDispatcher && (
-        <DispatcherPanel
-          result={result}
-          hospitalMap={hospitalMap}
-          incidentLocation={incident}
-          onClose={() => setShowDispatcher(false)}
-          onRerunWithSceneData={handleRerunWithSceneData}
-        />
+        <Suspense fallback={<div className="fixed inset-0 z-[9999] grid place-items-center bg-[#06080e]/96 text-sm text-slate-400">Loading command center...</div>}>
+          <DispatcherPanel
+            result={result}
+            hospitalMap={hospitalMap}
+            incidentLocation={incident}
+            onClose={() => setShowDispatcher(false)}
+            onRerunWithSceneData={handleRerunWithSceneData}
+          />
+        </Suspense>
       )}
 
       {/* AI vs Fallback Comparison */}
       {showComparison && (
-        <ComparisonPanel
-          aiResult={result}
-          fallbackResult={comparisonResult}
-          fallbackLoading={comparisonLoading}
-          onClose={() => setShowComparison(false)}
-        />
+        <Suspense fallback={<div className="fixed inset-0 z-[9999] grid place-items-center bg-[#06080e]/96 text-sm text-slate-400">Loading comparison...</div>}>
+          <ComparisonPanel
+            aiResult={result}
+            fallbackResult={comparisonResult}
+            fallbackLoading={comparisonLoading}
+            onClose={() => setShowComparison(false)}
+          />
+        </Suspense>
       )}
     </div>
   )
