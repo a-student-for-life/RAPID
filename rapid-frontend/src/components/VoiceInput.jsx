@@ -1,15 +1,27 @@
 import React, { useState, useRef } from 'react'
 import axios from 'axios'
 
+const LANG_OPTIONS = [
+  { code: 'en', label: 'EN', title: 'English' },
+  { code: 'hi', label: 'हिं', title: 'हिंदी (Hindi)' },
+  { code: 'mr', label: 'मरा', title: 'मराठी (Marathi)' },
+]
+
 /**
  * Voice input button — records audio via MediaRecorder, sends to
  * POST /api/transcribe, and calls onParsed with the structured result
  * so the parent form can auto-fill.
+ *
+ * The language selector hints Whisper for Indian-language dispatch calls
+ * ("Kurla mein train accident, 35 log zakhmi hain"). Whisper-Large-V3 is
+ * multilingual out of the box — the hint just improves transcription
+ * accuracy and keeps Devanagari output from being romanised.
  */
 export default function VoiceInput({ onParsed }) {
   const [state,      setState]      = useState('idle')   // idle | recording | processing | done | error
   const [transcript, setTranscript] = useState('')
   const [errorMsg,   setErrorMsg]   = useState('')
+  const [language,   setLanguage]   = useState('en')
   const mediaRecorderRef = useRef(null)
   const chunksRef        = useRef([])
 
@@ -47,6 +59,7 @@ export default function VoiceInput({ onParsed }) {
     const blob     = new Blob(chunksRef.current, { type: 'audio/webm' })
     const formData = new FormData()
     formData.append('audio', blob, 'recording.webm')
+    formData.append('language', language)
 
     try {
       const res = await axios.post('/api/transcribe', formData, {
@@ -103,6 +116,33 @@ export default function VoiceInput({ onParsed }) {
           )}
         </button>
 
+        {/* Language chooser — only visible when not mid-recording */}
+        {!isRecording && !isProcessing && (
+          <div
+            className="flex items-center rounded border border-rapid-border overflow-hidden text-[10px] font-bold"
+            role="radiogroup"
+            aria-label="Transcription language"
+          >
+            {LANG_OPTIONS.map(opt => (
+              <button
+                key={opt.code}
+                type="button"
+                role="radio"
+                aria-checked={language === opt.code}
+                title={opt.title}
+                onClick={() => setLanguage(opt.code)}
+                className={`px-1.5 py-1 transition-colors ${
+                  language === opt.code
+                    ? 'bg-blue-900/60 text-blue-200'
+                    : 'bg-rapid-surface text-slate-500 hover:text-blue-300'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {state === 'done' && (
           <span className="text-xs text-green-400">✓ Form filled</span>
         )}
@@ -120,7 +160,11 @@ export default function VoiceInput({ onParsed }) {
 
       {state === 'idle' && (
         <p className="text-xs text-slate-600">
-          e.g. "Building collapse at Dharavi, 30 casualties, crush injuries"
+          {language === 'hi'
+            ? 'e.g. "Kurla mein train accident, 35 log zakhmi hain"'
+            : language === 'mr'
+              ? 'e.g. "Kurla station par train accident zala, 35 zakhmi"'
+              : 'e.g. "Building collapse at Dharavi, 30 casualties, crush injuries"'}
         </p>
       )}
     </div>

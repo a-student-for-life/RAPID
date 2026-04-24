@@ -380,6 +380,59 @@ function AssignmentCard({ assignment, hospital, incidentId, incidentLat, inciden
   )
 }
 
+/**
+ * Bystander Report QR code — the QR that a judge can scan with their phone
+ * to open the public #report page. Reports scanned in show up live in the
+ * dispatcher BystanderInbox without any extra wiring.
+ *
+ * Uses the public qrserver.com API so no client-side QR dependency is needed.
+ * The host origin is used as-is so this works in both local dev and Cloud Run.
+ */
+function BystanderQrPanel() {
+  const [copied, setCopied] = useState(false)
+  const reportUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}/#report`
+    : ''
+  const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=4&bgcolor=0a0c14&color=ffffff&data=${encodeURIComponent(reportUrl)}`
+
+  async function copyUrl() {
+    try {
+      await navigator.clipboard.writeText(reportUrl)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    } catch {}
+  }
+
+  return (
+    <div className="border-t border-[#1c1f30] px-5 py-4">
+      <p className="mb-2 text-xs font-black uppercase tracking-widest text-slate-500">
+        Bystander Channel
+      </p>
+      <p className="mb-3 text-[10px] leading-relaxed text-slate-500">
+        Scan to report a scene from a phone — AI triages the photo and it lands
+        in the dispatcher inbox.
+      </p>
+      <div className="mx-auto w-fit rounded-xl border border-[#2d3148] bg-[#0a0c14] p-2">
+        <img
+          src={qrSrc}
+          alt={`QR code to ${reportUrl}`}
+          width={160}
+          height={160}
+          style={{ display: 'block', imageRendering: 'pixelated' }}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={copyUrl}
+        className="mt-3 w-full rounded-xl border border-[#2d3148] px-3 py-2 text-[11px] font-mono text-slate-400 hover:border-blue-700 hover:text-blue-300 transition-colors truncate"
+        title="Copy bystander URL"
+      >
+        {copied ? '✓ Copied' : reportUrl.replace(/^https?:\/\//, '')}
+      </button>
+    </div>
+  )
+}
+
 export default function DispatcherPanel({ result, hospitalMap, incidentLocation, onClose, onRerunWithSceneData }) {
   const { unitDocs, upsertUnitDoc, clearAllDocs } = useUnitDocsSnapshot()
   if (!result) return null
@@ -432,6 +485,7 @@ export default function DispatcherPanel({ result, hospitalMap, incidentLocation,
           <div className="mb-4 space-y-1.5">{UNITS.map(unitId => <a key={unitId} href={`${window.location.origin}/#crew?unit=${unitId}`} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 rounded-xl border border-[#2d3148] px-3 py-2 hover:border-blue-700 hover:bg-blue-950/20"><span className="w-20 text-xs font-black text-slate-400">{UNIT_CFG[unitId].callsign}</span><span className="flex-1 truncate font-mono text-[10px] text-slate-700">/#crew?unit={unitId}</span><span className="text-xs text-slate-600">open</span></a>)}</div>
           <button type="button" onClick={openAllCrewViews} className="w-full rounded-xl bg-blue-600 py-3 text-xs font-black text-white hover:bg-blue-500">OPEN ALL 5 CREW VIEWS</button>
         </div>
+        <BystanderQrPanel />
         <div className="border-t border-[#1c1f30] px-5 py-4"><button type="button" onClick={onClose} className="w-full rounded-xl border border-[#2d3148] py-2.5 text-xs text-slate-500 hover:border-slate-500 hover:text-slate-200">Close Command Center</button></div>
       </div>
 

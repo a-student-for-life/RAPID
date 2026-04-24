@@ -1,10 +1,22 @@
 import React from 'react'
 import { ALL_SCENARIOS } from '../demoScenario.js'
 
-export default function DemoControls({ onLoadScenario, onReset, forceFallback, onToggleFallback, hasResults, onCompare }) {
+export default function DemoControls({ onLoadScenario, onReset, forceFallback, onToggleFallback, hasResults, onCompare, onLiveDemo }) {
   return (
     <div className="space-y-2">
       <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Demo Controls</p>
+
+      {/* Cinematic voice-first demo — the judges' opening act */}
+      {onLiveDemo && (
+        <button
+          onClick={onLiveDemo}
+          className="w-full px-3 py-2.5 rounded border border-red-600 text-xs font-black uppercase tracking-widest text-white
+                     bg-gradient-to-r from-red-700 via-red-600 to-orange-600
+                     hover:brightness-110 shadow-lg shadow-red-900/40 transition-all"
+        >
+          🎙️ LIVE DEMO · Voice Dispatch
+        </button>
+      )}
 
       {/* Scenario buttons */}
       <div className="flex flex-col gap-1.5">

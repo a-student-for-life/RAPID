@@ -11,6 +11,74 @@ function summarise(result) {
   return { assignments, critical, moderate, minor, topHospital }
 }
 
+/* ── Hospital load distribution: the visual punchline ─────────────────────
+ * Naïve "closest hospital" dumps everyone into one place → one bright-red
+ * bar while every other hospital sits idle. RAPID spreads the load → bars
+ * are low and uniform. Judges get the value prop in a single glance.
+ */
+function effectiveBeds(hospital) {
+  const cap = hospital?.capacity || {}
+  const icu = Number(cap.available_icu) || 0
+  const beds = Number(cap.available_beds) || 0
+  return Math.max(1, icu + beds / 20)
+}
+function satColor(pct) {
+  if (pct >= 90) return '#ef4444'
+  if (pct >= 60) return '#f59e0b'
+  return '#10b981'
+}
+function LoadDistribution({ result }) {
+  if (!result) return null
+  const assignments = result.assignments || []
+  const hospitals   = result.hospitals   || []
+  if (hospitals.length === 0 || assignments.length === 0) return null
+
+  const byHospital = new Map()
+  assignments.forEach(a => {
+    byHospital.set(a.hospital, (byHospital.get(a.hospital) || 0) + (a.patients_assigned || 0))
+  })
+  const rows = hospitals
+    .map(h => {
+      const count = byHospital.get(h.name) || 0
+      const sat = Math.max(0, Math.min(200, (count / effectiveBeds(h)) * 100))
+      return { name: h.name, count, sat }
+    })
+    .filter(r => r.count > 0 || true)   // keep idle hospitals to show the imbalance
+    .sort((a, b) => b.sat - a.sat)
+    .slice(0, 6)
+
+  return (
+    <div className="rounded-xl bg-slate-800 border border-slate-600 px-3 py-2.5">
+      <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-2">
+        Hospital load distribution
+      </p>
+      <div className="space-y-1.5">
+        {rows.map(r => {
+          const width = Math.min(100, r.sat)  // visual cap at 100%; chip shows true %
+          return (
+            <div key={r.name} className="flex items-center gap-2 text-[10px]">
+              <span className="w-24 truncate text-slate-300" title={r.name}>{r.name}</span>
+              <div className="relative flex-1 h-2.5 rounded bg-slate-900 border border-slate-700 overflow-hidden">
+                <div
+                  className="absolute left-0 top-0 bottom-0 transition-all"
+                  style={{ width: `${width}%`, background: satColor(r.sat) }}
+                />
+              </div>
+              <span
+                className="w-12 text-right font-black font-mono"
+                style={{ color: satColor(r.sat) }}
+              >
+                {Math.round(r.sat)}%
+              </span>
+              <span className="w-8 text-right text-slate-500">{r.count}p</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 /* ── Explainer: what do these terms mean? ────────────────────────────────── */
 function TermExplainer() {
   const [open, setOpen] = useState(false)
@@ -130,6 +198,9 @@ function ComparisonColumn({ label, result, loading, color }) {
           </div>
         </div>
       )}
+
+      {/* Load distribution — naïve piles up, RAPID spreads */}
+      <LoadDistribution result={result} />
 
       {/* Assignments */}
       <div className="space-y-1.5">

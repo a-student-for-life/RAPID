@@ -47,7 +47,11 @@ Transcript:
 """
 
 
-async def parse_audio(audio_bytes: bytes, content_type: str) -> dict[str, Any]:
+async def parse_audio(
+    audio_bytes: bytes,
+    content_type: str,
+    language: str | None = None,
+) -> dict[str, Any]:
     """
     Accept raw audio bytes, return structured incident dict:
     {
@@ -57,15 +61,20 @@ async def parse_audio(audio_bytes: bytes, content_type: str) -> dict[str, Any]:
         "lon":            float | None,
         "patient_groups": list[dict],
         "notes":          str,
+        "language":       str | None,
     }
     Raises ValueError if GROQ_API_KEY not set or transcription fails.
+
+    `language` is an ISO-639-1 code ("en", "hi", "mr"). When None, Whisper
+    auto-detects. Whisper-Large-V3 is multilingual — Hindi and Marathi are
+    both supported directly by the same model.
     """
     if not _GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set — voice input unavailable")
 
     # ── Step 1: transcribe with Whisper ──────────────────────────────────────
-    transcript = await _transcribe(audio_bytes, content_type)
-    logger.info("Whisper transcript: %s", transcript[:120])
+    transcript = await _transcribe(audio_bytes, content_type, language)
+    logger.info("Whisper transcript [%s]: %s", language or "auto", transcript[:120])
 
     # ── Step 2: extract structured data ──────────────────────────────────────
     extracted = await _extract(transcript)
@@ -82,21 +91,35 @@ async def parse_audio(audio_bytes: bytes, content_type: str) -> dict[str, Any]:
         "lon":            lon,
         "patient_groups": extracted.get("patient_groups", []),
         "notes":          extracted.get("notes", ""),
+        "language":       language,
     }
 
 
 # ── Step 1: Whisper transcription ─────────────────────────────────────────────
 
-async def _transcribe(audio_bytes: bytes, content_type: str) -> str:
+async def _transcribe(
+    audio_bytes: bytes,
+    content_type: str,
+    language: str | None = None,
+) -> str:
     ext = "webm" if "webm" in content_type else "wav" if "wav" in content_type else "m4a"
     filename = f"audio.{ext}"
+
+    data: dict[str, str] = {
+        "model": "whisper-large-v3",
+        "response_format": "text",
+    }
+    # Passing an ISO-639-1 hint to Whisper improves accuracy for non-English
+    # dialects and prevents silent English-script romanisation.
+    if language:
+        data["language"] = language
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             _WHISPER_URL,
             headers={"Authorization": f"Bearer {_GROQ_API_KEY}"},
             files={"file": (filename, audio_bytes, content_type)},
-            data={"model": "whisper-large-v3", "response_format": "text"},
+            data=data,
         )
 
     if response.status_code != 200:

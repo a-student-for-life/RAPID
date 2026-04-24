@@ -19,6 +19,7 @@ const RapidMap = lazy(() => import('./components/Map.jsx'))
 const DispatcherPanel = lazy(() => import('./components/DispatcherPanel.jsx'))
 const ComparisonPanel = lazy(() => import('./components/ComparisonPanel.jsx'))
 const WhatsAppSimulator = lazy(() => import('./components/WhatsAppSimulator.jsx'))
+const LiveDemoOverlay = lazy(() => import('./components/LiveDemoOverlay.jsx'))
 
 const DEFAULT_SDG_STATS = {
   totalPatients: 0,
@@ -29,6 +30,7 @@ const DEFAULT_SDG_STATS = {
   traumaSaves: 0,
   specialtySaves: 0,
   goldenHourExtra: 0,
+  survivabilityPointsTotal: 0,  // Σ(minutes_delta) across all dispatches. Lerner & Moscati 2001: 1 min delay ≈ 1pp survival drop for critical trauma.
 }
 
 function loadSdgStats() {
@@ -36,6 +38,55 @@ function loadSdgStats() {
     const saved = JSON.parse(localStorage.getItem('rapid_sdg_stats')) || {}
     return { ...DEFAULT_SDG_STATS, ...saved }
   } catch { return DEFAULT_SDG_STATS }
+}
+
+/**
+ * Slim always-visible strip under the main header that turns ongoing dispatches
+ * into the SDG 3 / SDG 11 story. Judges see impact accumulating in real time
+ * without scrolling to the sidebar.
+ */
+function SdgImpactStrip({ stats }) {
+  const survival = Number(stats?.survivabilityPointsTotal ?? 0)
+  const minutes  = Number(stats?.minutesSavedTotal ?? 0)
+  const hasRuns  = (stats?.totalDispatches ?? 0) > 0
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-1 border-t border-rapid-border/60 bg-rapid-bg/60 text-[11px]">
+      <span className="font-bold tracking-wide text-slate-400">🌍 SDG Impact</span>
+      <span className="flex items-center gap-1 text-slate-300">
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#3F7E44' }} />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">SDG 3</span>
+        <span className="hidden md:inline text-slate-500">Good Health</span>
+      </span>
+      <span className="flex items-center gap-1 text-slate-300">
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#FD6925' }} />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">SDG 11</span>
+        <span className="hidden md:inline text-slate-500">Sustainable Cities</span>
+      </span>
+      <span className="text-slate-700">|</span>
+      <span className="text-slate-400">
+        Session:{' '}
+        <span className="font-black text-blue-300">{stats?.totalPatients ?? 0}</span>
+        <span className="text-slate-500"> routed</span>
+      </span>
+      <span className="text-slate-400">
+        <span className={`font-black ${minutes >= 0 ? 'text-green-300' : 'text-amber-300'}`}>
+          {minutes >= 0 ? '−' : '+'}{Math.abs(minutes).toFixed(1)}m
+        </span>
+        <span className="text-slate-500"> vs naïve</span>
+      </span>
+      <span className="text-slate-400">
+        <span className={`font-black ${survival >= 0 ? 'text-green-300' : 'text-amber-300'}`}>
+          {survival >= 0 ? '↑' : '↓'} {Math.abs(survival).toFixed(1)}%
+        </span>
+        <span className="text-slate-500"> survival odds</span>
+      </span>
+      {!hasRuns && (
+        <span className="ml-auto text-[10px] text-slate-600 italic">
+          run a dispatch to populate
+        </span>
+      )}
+    </div>
+  )
 }
 
 export default function App() {
@@ -65,6 +116,7 @@ export default function App() {
   const [showDispatcher,    setShowDispatcher]    = useState(false)
   const [showComparison,    setShowComparison]    = useState(false)
   const [showWhatsApp,      setShowWhatsApp]      = useState(false)
+  const [showLiveDemo,      setShowLiveDemo]      = useState(false)
   const [comparisonResult,  setComparisonResult]  = useState(null)
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [systemStatus,      setSystemStatus]      = useState(null)
@@ -208,6 +260,7 @@ export default function App() {
               traumaSaves:       (sdgStats.traumaSaves ?? 0) + (cf.trauma_preserved ? 1 : 0),
               specialtySaves:    (sdgStats.specialtySaves ?? 0) + (cf.specialty_preserved ? 1 : 0),
               goldenHourExtra:   (sdgStats.goldenHourExtra ?? 0) + Number(cf.critical_in_golden_hour_delta || 0),
+              survivabilityPointsTotal: (sdgStats.survivabilityPointsTotal ?? 0) + Number(cf.survivability_delta || 0),
             }
             setSdgStats(newStats)
             localStorage.setItem('rapid_sdg_stats', JSON.stringify(newStats))
@@ -404,9 +457,10 @@ export default function App() {
     <div className="flex flex-col h-screen bg-rapid-bg text-slate-200 overflow-hidden">
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className={`flex items-center justify-between px-4 py-2.5 border-b shrink-0 transition-colors duration-700 ${
+      <header className={`flex flex-col border-b shrink-0 transition-colors duration-700 ${
         showMCI ? 'bg-red-950/70 border-red-900' : 'bg-rapid-surface border-rapid-border'
       }`}>
+      <div className="flex items-center justify-between px-4 py-2.5">
         <div className="flex items-center gap-2.5">
           <span className="text-2xl">🚑</span>
           <div>
@@ -477,6 +531,10 @@ export default function App() {
             API docs →
           </a>
         </div>
+      </div>
+
+      {/* SDG impact strip — visible in first 3 seconds of any demo */}
+      <SdgImpactStrip stats={sdgStats} />
       </header>
 
       {/* ── Body ───────────────────────────────────────────────────────────── */}
@@ -509,6 +567,7 @@ export default function App() {
                 onToggleFallback={() => setForceFallback(f => !f)}
                 hasResults={!!result}
                 onCompare={result ? handleCompare : null}
+                onLiveDemo={() => setShowLiveDemo(true)}
               />
             </section>
 
@@ -619,6 +678,16 @@ export default function App() {
             incidentId={result?.incident_id || null}
             assignments={result?.assignments || []}
             onClose={() => setShowWhatsApp(false)}
+          />
+        </Suspense>
+      )}
+
+      {/* Cinematic voice-first demo */}
+      {showLiveDemo && (
+        <Suspense fallback={null}>
+          <LiveDemoOverlay
+            onDispatch={(payload) => { handleSubmit(payload) }}
+            onClose={() => setShowLiveDemo(false)}
           />
         </Suspense>
       )}

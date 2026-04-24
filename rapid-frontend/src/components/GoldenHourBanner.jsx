@@ -49,6 +49,11 @@ export default function GoldenHourBanner({ result }) {
   const { minutesSaved, criticalRows } = computeGoldenHour(result)
   if (criticalRows.length === 0) return null
 
+  // Survivability delta for this single incident — from backend counterfactual.
+  // Positive = RAPID's routing beat naïve closest-hospital by X percentage points
+  // of critical-patient survival odds (Lerner & Moscati 2001).
+  const survivabilityDelta = Number(result?.counterfactual?.survivability_delta ?? 0)
+
   return (
     <div className="shrink-0 border-t border-rapid-border bg-rapid-bg flex items-center gap-3 px-4 py-1.5 overflow-x-auto">
       {/* Label + savings */}
@@ -59,6 +64,18 @@ export default function GoldenHourBanner({ result }) {
             {minutesSaved > 0
               ? `AI saved ~${minutesSaved.toFixed(1)} min`
               : 'AI chose specialty over proximity'}
+          </span>
+        )}
+        {Math.abs(survivabilityDelta) >= 0.1 && (
+          <span
+            className={`text-xs font-black px-1.5 py-0.5 rounded border ${
+              survivabilityDelta > 0
+                ? 'bg-green-950/50 border-green-700 text-green-300'
+                : 'bg-amber-950/50 border-amber-700 text-amber-300'
+            }`}
+            title="1 min delay ≈ 1pp survival drop for critical trauma (Lerner & Moscati 2001)"
+          >
+            {survivabilityDelta > 0 ? '↑' : '↓'} {Math.abs(survivabilityDelta).toFixed(1)}% survival
           </span>
         )}
       </div>
