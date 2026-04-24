@@ -11,6 +11,8 @@ GET   /api/incident/{id}              - fetch full incident by ID (for crew view
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -22,6 +24,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 CrewStatus = Literal["dispatched", "en_route", "on_scene", "transporting", "closed", "standby"]
+PrealertStatus = Literal["accepted", "diverted", "auto_accepted"]
+
+PREALERT_EXPIRY_SECONDS = 90  # hospitals have 90s to respond before auto-accept
 
 
 class CrewDispatchRequest(BaseModel):
@@ -120,18 +125,102 @@ async def update_crew_status(unit_id: str, payload: CrewStatusRequest):
     return {"status": "updated", "unit": unit_id, "crew_status": payload.status}
 
 
+class PrealertResponseRequest(BaseModel):
+    status:    PrealertStatus
+    note:      str = ""
+    responder: Optional[str] = None
+
+
+def _safe_hospital_key(hospital_id: str) -> str:
+    """Firestore-safe key for hospital name (no slashes)."""
+    return hospital_id.replace("/", "_").replace(".", "_").strip()
+
+
 @router.post("/hospitals/{hospital_id}/prealert")
 async def prealert_hospital(hospital_id: str, payload: HospitalPrealertRequest):
-    """Record that the dispatcher pre-alerted a destination hospital."""
-    prealert = payload.model_dump()
+    """
+    Record that the dispatcher pre-alerted a destination hospital AND drop a
+    pointer doc into `hospital_prealerts/{prealert_id}` so the kiosk can
+    subscribe by hospital id and respond with accept/divert.
+    """
+    now = datetime.now(timezone.utc)
+    prealert_id = str(uuid.uuid4())
+    expires_at = (now + timedelta(seconds=PREALERT_EXPIRY_SECONDS)).isoformat()
+
+    prealert = {
+        **payload.model_dump(),
+        "prealert_id": prealert_id,
+        "timestamp":   now.isoformat(),
+        "expires_at":  expires_at,
+        "status":      "pending",
+    }
+
     await firestore_client.record_hospital_prealert(payload.incident_id, hospital_id, prealert)
+
+    # Kiosk URL uses the human-readable name (#hospital?name=...), so hospital_id
+    # must be derived from hospital_name — NOT the URL param (which can be an OSM ID).
+    kiosk_hospital_key = _safe_hospital_key(payload.hospital_name or hospital_id)
+    kiosk_doc = {
+        "prealert_id":       prealert_id,
+        "incident_id":       payload.incident_id,
+        "hospital_id":       kiosk_hospital_key,
+        "hospital_name":     payload.hospital_name,
+        "severity":          payload.severity,
+        "patients_assigned": payload.patients_assigned,
+        "eta_minutes":       payload.eta_minutes,
+        "unit_id":           payload.unit_id,
+        "note":              payload.note,
+        "created_at":        now.isoformat(),
+        "expires_at":        expires_at,
+        "status":            "pending",
+    }
+    await firestore_client.save_kiosk_prealert(prealert_id, kiosk_doc)
+
     logger.info(
-        "Hospital pre-alert: incident=%s hospital=%s patients=%s",
+        "Hospital pre-alert: incident=%s hospital=%s patients=%s prealert=%s",
         payload.incident_id,
         payload.hospital_name,
         payload.patients_assigned,
+        prealert_id,
     )
-    return {"status": "recorded", "hospital_id": hospital_id}
+    return {
+        "status":      "recorded",
+        "hospital_id": hospital_id,
+        "prealert_id": prealert_id,
+        "expires_at":  expires_at,
+    }
+
+
+@router.post("/prealerts/{prealert_id}/respond")
+async def respond_prealert(prealert_id: str, payload: PrealertResponseRequest):
+    """
+    Hospital kiosk accept/divert response. Also writes back onto the incident
+    doc so the dispatcher sees the resolution in real time.
+    """
+    updated = await firestore_client.respond_to_prealert(
+        prealert_id,
+        status=payload.status,
+        note=payload.note,
+        responder=payload.responder,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Pre-alert not found.")
+
+    logger.info(
+        "Prealert response: id=%s hospital=%s status=%s",
+        prealert_id,
+        updated.get("hospital_name"),
+        payload.status,
+    )
+    return {"status": "updated", "prealert_id": prealert_id, "result": payload.status}
+
+
+@router.post("/crew/reset-all")
+async def reset_all_crews():
+    """Reset all crew units to standby in Firestore. Used by dispatcher to clear stale state."""
+    units = ["AMB_1", "AMB_2", "AMB_3", "AMB_4", "AMB_5"]
+    await firestore_client.reset_all_crew_assignments(units)
+    return {"status": "reset", "units": units}
 
 
 @router.get("/incident/{incident_id}")
@@ -141,3 +230,16 @@ async def get_incident_by_id(incident_id: str):
     if doc is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return doc
+
+
+@router.get("/kiosk/{hospital_key:path}/prealerts")
+async def get_kiosk_prealerts(hospital_key: str, limit: int = 20):
+    """
+    REST polling fallback for the hospital kiosk.
+    Accepts the hospital name (URL-encoded) and returns matching prealerts.
+    """
+    safe_key = _safe_hospital_key(hospital_key)
+    rows = await firestore_client.get_kiosk_prealerts_for_hospital(
+        safe_key, limit=min(max(1, limit), 50)
+    )
+    return {"hospital_key": safe_key, "prealerts": rows, "count": len(rows)}

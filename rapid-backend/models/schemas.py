@@ -44,3 +44,4 @@ class IncidentResponse(BaseModel):
     reasoning:     str = ""
     elapsed_s:     float = 0.0
     agencies:      list[dict[str, Any]] = []
+    counterfactual: Optional[dict[str, Any]] = None

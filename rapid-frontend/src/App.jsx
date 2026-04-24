@@ -9,25 +9,43 @@ import DispatchFeed      from './components/DispatchFeed.jsx'
 import MCIBanner         from './components/MCIBanner.jsx'
 import GoldenHourBanner  from './components/GoldenHourBanner.jsx'
 import SDGWidget         from './components/SDGWidget.jsx'
+import PrepositioningPanel from './components/PrepositioningPanel.jsx'
+import BystanderInbox    from './components/BystanderInbox.jsx'
 import { DEMO_SCENARIO } from './demoScenario.js'
 import { AUTO_DEMO_ENABLED } from './lib/appConfig.js'
-import { buildRerouteConfirmationMessage, getConsensusPatientGroups } from './lib/sceneIntel.js'
+import { getConsensusPatientGroups } from './lib/sceneIntel.js'
 
 const RapidMap = lazy(() => import('./components/Map.jsx'))
 const DispatcherPanel = lazy(() => import('./components/DispatcherPanel.jsx'))
 const ComparisonPanel = lazy(() => import('./components/ComparisonPanel.jsx'))
+const WhatsAppSimulator = lazy(() => import('./components/WhatsAppSimulator.jsx'))
 
-const DEFAULT_SDG_STATS = { totalPatients: 0, totalCritical: 0, totalDispatches: 0, totalElapsedMs: 0 }
+const DEFAULT_SDG_STATS = {
+  totalPatients: 0,
+  totalCritical: 0,
+  totalDispatches: 0,
+  totalElapsedMs: 0,
+  minutesSavedTotal: 0,
+  traumaSaves: 0,
+  specialtySaves: 0,
+  goldenHourExtra: 0,
+}
 
 function loadSdgStats() {
-  try { return JSON.parse(localStorage.getItem('rapid_sdg_stats')) || DEFAULT_SDG_STATS }
-  catch { return DEFAULT_SDG_STATS }
+  try {
+    const saved = JSON.parse(localStorage.getItem('rapid_sdg_stats')) || {}
+    return { ...DEFAULT_SDG_STATS, ...saved }
+  } catch { return DEFAULT_SDG_STATS }
 }
 
 export default function App() {
   const [loading,       setLoading]       = useState(false)
-  const [result,        setResult]        = useState(null)
-  const [incident,      setIncident]      = useState(null)
+  const [result,        setResult]        = useState(() => {
+    try { const s = sessionStorage.getItem('rapid_result'); return s ? JSON.parse(s) : null } catch { return null }
+  })
+  const [incident,      setIncident]      = useState(() => {
+    try { const s = sessionStorage.getItem('rapid_incident'); return s ? JSON.parse(s) : null } catch { return null }
+  })
   const [error,         setError]         = useState(null)
   const [forceFallback, setForceFallback] = useState(false)
   const [histRefresh,   setHistRefresh]   = useState(0)
@@ -46,10 +64,11 @@ export default function App() {
 
   const [showDispatcher,    setShowDispatcher]    = useState(false)
   const [showComparison,    setShowComparison]    = useState(false)
+  const [showWhatsApp,      setShowWhatsApp]      = useState(false)
   const [comparisonResult,  setComparisonResult]  = useState(null)
   const [comparisonLoading, setComparisonLoading] = useState(false)
   const [systemStatus,      setSystemStatus]      = useState(null)
-  const [sceneIntel,        setSceneIntel]        = useState(null)  // aggregated scene reports
+  const [sceneIntelCount,   setSceneIntelCount]   = useState(0)
 
   const dismissTimer    = useRef(null)
   const autoRan         = useRef(false)
@@ -63,24 +82,33 @@ export default function App() {
       .catch(() => {})
   }, [])
 
-  /* ── Scene intel polling — runs whenever a dispatched incident is active ─── */
+  /* ── Scene intel badge count — only the number, panel lives in Command Center ── */
   useEffect(() => {
-    if (!result?.incident_id) { setSceneIntel(null); return }
+    if (!result?.incident_id) { setSceneIntelCount(0); return }
     const id = result.incident_id
-
     async function poll() {
       try {
-        const res = await fetch(`/api/scene-assessments/${id}`)
+        const res = await fetch(`/api/scene-intel/${id}`)
         if (!res.ok) return
         const data = await res.json()
-        setSceneIntel(data.aggregated?.report_count > 0 ? data.aggregated : null)
+        setSceneIntelCount(data.aggregated?.report_count ?? 0)
       } catch {}
     }
-
-    poll()                                          // immediate first fetch
-    const interval = setInterval(poll, 5000)        // then every 5 s
+    poll()
+    const interval = setInterval(poll, 3000)
     return () => clearInterval(interval)
   }, [result?.incident_id])
+
+  /* ── Persist result + incident across hash-route navigation ────────────── */
+  useEffect(() => {
+    if (result) sessionStorage.setItem('rapid_result', JSON.stringify(result))
+    else sessionStorage.removeItem('rapid_result')
+  }, [result])
+
+  useEffect(() => {
+    if (incident) sessionStorage.setItem('rapid_incident', JSON.stringify(incident))
+    else sessionStorage.removeItem('rapid_incident')
+  }, [incident])
 
   /* ── Auto-demo: load Kurla scenario + dispatch after 1.5s ───────────────── */
   useEffect(() => {
@@ -101,6 +129,11 @@ export default function App() {
 
   /* ── SSE streaming dispatch ──────────────────────────────────────────────── */
   const handleSubmit = useCallback(async (payload) => {
+    // Clear stale crew assignments from any prior session on each fresh dispatch
+    ;['AMB_1', 'AMB_2', 'AMB_3', 'AMB_4', 'AMB_5'].forEach(unitId => {
+      localStorage.removeItem(`rapid_crew_${unitId}`)
+      localStorage.removeItem(`rapid_status_queue_${unitId}`)
+    })
     setLoading(true)
     setError(null)
     setResult(null)
@@ -165,11 +198,16 @@ export default function App() {
             const newCritical = (data.result.assignments || [])
               .filter(a => a.severity === 'critical')
               .reduce((s, a) => s + a.patients_assigned, 0)
+            const cf = data.result.counterfactual || {}
             const newStats = {
-              totalPatients:   sdgStats.totalPatients + total,
-              totalCritical:   sdgStats.totalCritical + newCritical,
-              totalDispatches: sdgStats.totalDispatches + 1,
-              totalElapsedMs:  sdgStats.totalElapsedMs + (Date.now() - t0),
+              totalPatients:     sdgStats.totalPatients + total,
+              totalCritical:     sdgStats.totalCritical + newCritical,
+              totalDispatches:   sdgStats.totalDispatches + 1,
+              totalElapsedMs:    sdgStats.totalElapsedMs + (Date.now() - t0),
+              minutesSavedTotal: (sdgStats.minutesSavedTotal ?? 0) + Number(cf.minutes_saved_total || 0),
+              traumaSaves:       (sdgStats.traumaSaves ?? 0) + (cf.trauma_preserved ? 1 : 0),
+              specialtySaves:    (sdgStats.specialtySaves ?? 0) + (cf.specialty_preserved ? 1 : 0),
+              goldenHourExtra:   (sdgStats.goldenHourExtra ?? 0) + Number(cf.critical_in_golden_hour_delta || 0),
             }
             setSdgStats(newStats)
             localStorage.setItem('rapid_sdg_stats', JSON.stringify(newStats))
@@ -197,13 +235,22 @@ export default function App() {
     setIncident(null)
   }
 
-  function handleReset() {
+  async function handleReset() {
+    // Dismiss all pending bystander reports so the inbox is clean for the next session
+    try { await fetch('/api/bystander/reports/dismiss-all', { method: 'POST' }) } catch {}
+    // Clear persisted crew assignments so Command Center starts fresh
+    ;['AMB_1', 'AMB_2', 'AMB_3', 'AMB_4', 'AMB_5'].forEach(unitId => {
+      localStorage.removeItem(`rapid_crew_${unitId}`)
+      localStorage.removeItem(`rapid_status_queue_${unitId}`)
+    })
+    sessionStorage.removeItem('rapid_result')
+    sessionStorage.removeItem('rapid_incident')
     setResult(null)
     setIncident(null)
     setError(null)
     setDemoValues(null)
     setMapLocation(null)
-    setSceneIntel(null)
+    setSceneIntelCount(0)
     // sdgStats intentionally NOT reset — accumulates across session
   }
 
@@ -216,14 +263,13 @@ export default function App() {
     const patients = patientGroups
       .filter(pg => pg.count > 0)
       .map(pg => ({ severity: pg.severity, count: pg.count, injury_type: pg.injury_type ?? null }))
-    if (!patients.length) return
+    if (!patients.length) {
+      setError('Scene intel has no patient counts yet — wait for the crew photo to finish processing.')
+      return
+    }
+
     setPendingTotal(patients.reduce((sum, patient) => sum + patient.count, 0))
     setPendingTypes([...new Set(patients.map(patient => patient.injury_type).filter(Boolean))])
-
-    const confirmed = window.confirm(
-      buildRerouteConfirmationMessage(sceneSummary, result?.assignments || []),
-    )
-    if (!confirmed) return
 
     setLoading(true)
     setError(null)
@@ -257,9 +303,10 @@ export default function App() {
       setResult(data)
       setElapsed(Number(data.elapsed_s || 0).toFixed(2))
       setDispatchDone(true)
-      setShowDispatcher(false)
+      // Open Command Center so dispatcher can immediately re-dispatch crews with new assignments
+      setShowDispatcher(true)
       setHistRefresh(n => n + 1)
-      setStreamLogs([{ type: 'step', step: 1, done: true, msg: 'Reroute complete from confirmed scene reports.' }])
+      setStreamLogs([{ type: 'step', step: 1, done: true, msg: 'Reroute complete — open Command Center to re-dispatch crews.' }])
     } catch (err) {
       setError(err.message || 'Reroute failed')
     } finally {
@@ -312,6 +359,22 @@ export default function App() {
     finally { setComparisonLoading(false) }
   }
 
+  async function promoteBystanderReport(report) {
+    const triage = report?.triage || {}
+    const groups = (triage.patient_groups || [])
+      .filter(g => (g?.count ?? 0) > 0)
+      .map(g => ({
+        severity:    g.severity,
+        count:       g.count,
+        injury_type: g.injury_type ?? null,
+      }))
+    if (!groups.length) {
+      groups.push({ severity: 'moderate', count: Number(triage.estimated_casualties) || 1, injury_type: null })
+    }
+    await handleSubmit({ lat: report.lat, lon: report.lon, patients: groups })
+    return { incident_id: null }
+  }
+
   function handleLocationSelect(coords) { setMapLocation(coords) }
 
   function handleFeedDismiss() {
@@ -336,7 +399,6 @@ export default function App() {
       })()
     : false
   const showMCI = isMCI || preMCI
-  const sceneConsensusGroups = getConsensusPatientGroups(sceneIntel)
 
   return (
     <div className="flex flex-col h-screen bg-rapid-bg text-slate-200 overflow-hidden">
@@ -380,15 +442,22 @@ export default function App() {
               </span>
               <span className="text-slate-500">{elapsed}s · {totalPatients} routed</span>
               <button
+                onClick={() => setShowWhatsApp(true)}
+                className="px-2.5 py-1 rounded-full font-bold text-xs bg-emerald-700 text-white border border-emerald-500 hover:bg-emerald-600 transition-colors"
+                title="Open WhatsApp dispatch channel"
+              >
+                💬 CHAT
+              </button>
+              <button
                 onClick={() => setShowDispatcher(true)}
                 className="relative px-3 py-1 rounded-full font-black text-sm bg-blue-600 text-white border border-blue-500 hover:bg-blue-500 transition-colors shadow-lg shadow-blue-900/40"
               >
                 COMMAND CENTER ↗
-                {sceneIntel?.report_count > 0 && (
+                {sceneIntelCount > 0 && (
                   <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full
                                    bg-purple-500 border border-purple-300 text-[10px] font-black text-white
                                    flex items-center justify-center leading-none animate-pulse">
-                    {sceneIntel.report_count}
+                    {sceneIntelCount}
                   </span>
                 )}
               </button>
@@ -454,6 +523,17 @@ export default function App() {
             </section>
 
             <section className="pt-2 border-t border-rapid-border">
+              <BystanderInbox
+                onPromote={promoteBystanderReport}
+                activeIncidentId={result?.incident_id ?? null}
+              />
+            </section>
+
+            <section className="pt-2 border-t border-rapid-border">
+              <PrepositioningPanel basePosition={incident} />
+            </section>
+
+            <section className="pt-2 border-t border-rapid-border">
               <SDGWidget stats={sdgStats} />
             </section>
           </div>
@@ -485,86 +565,6 @@ export default function App() {
           </div>
 
           {result && <GoldenHourBanner result={result} />}
-
-          {/* Scene Intelligence Banner — appears when crew scene reports arrive */}
-          {result && sceneIntel?.report_count > 0 && (() => {
-            // Compute delta: scene numbers vs. original dispatch numbers
-            const origByType = {}
-            ;(result.assignments || []).forEach(a => {
-              origByType[a.severity] = (origByType[a.severity] || 0) + (a.patients_assigned || 0)
-            })
-            return (
-              <div className="shrink-0 border-t-2 border-purple-700 bg-purple-950/25 px-4 py-2.5">
-                <div className="flex items-center gap-4">
-                  {/* Label */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="text-purple-400 text-base">🔬</span>
-                    <div>
-                      <p className="text-xs font-black text-purple-300 leading-tight">
-                        Scene Intelligence · {sceneIntel.report_count} crew report{sceneIntel.report_count !== 1 ? 's' : ''}
-                      </p>
-                      <p className="text-[10px] leading-tight">
-                        <span className={
-                          sceneIntel.confidence === 'HIGH'   ? 'text-green-400 font-bold' :
-                          sceneIntel.confidence === 'MEDIUM' ? 'text-amber-400 font-bold' :
-                                                               'text-slate-500'
-                        }>{sceneIntel.confidence} CONFIDENCE</span>
-                        {sceneIntel.total_estimated != null && (
-                          <span className="text-slate-500"> · ~{sceneIntel.total_estimated} on scene</span>
-                        )}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Original → Scene comparison */}
-                  <div className="flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
-                      {['critical', 'moderate', 'minor'].map(sev => {
-                        const scenePg  = sceneConsensusGroups?.find(p => p.severity === sev)
-                      const sceneN   = scenePg?.count ?? 0
-                      const origN    = origByType[sev] ?? 0
-                      const delta    = sceneN - origN
-                      if (sceneN === 0 && origN === 0) return null
-                      const sevColor = sev === 'critical'
-                        ? 'border-red-800 bg-red-950/60 text-red-300'
-                        : sev === 'moderate'
-                        ? 'border-amber-800 bg-amber-950/60 text-amber-300'
-                        : 'border-green-800 bg-green-950/60 text-green-300'
-                      return (
-                        <span key={sev} className={`text-xs px-2 py-0.5 rounded-full border font-bold flex items-center gap-1 ${sevColor}`}>
-                          {sceneN} {sev}
-                          {delta !== 0 && (
-                            <span className={`text-[10px] font-black ${delta > 0 ? 'text-orange-400' : 'text-green-400'}`}>
-                              {delta > 0 ? `+${delta}` : delta}
-                            </span>
-                          )}
-                        </span>
-                      )
-                    })}
-                    {sceneIntel.hazard_flags?.length > 0 && (
-                      <span className="text-xs text-red-400 truncate ml-1">
-                        ⚠ {sceneIntel.hazard_flags.slice(0, 2).join(' · ')}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Rerun button */}
-                  <button
-                    onClick={() => handleRerunWithSceneData(sceneIntel, incident?.lat, incident?.lon)}
-                    className="shrink-0 px-3 py-1.5 rounded-lg bg-purple-700 hover:bg-purple-600 active:bg-purple-800
-                               text-white text-xs font-black transition-all shadow shadow-purple-900/40 whitespace-nowrap"
-                  >
-                    🔄 RERUN WITH SCENE DATA
-                  </button>
-                </div>
-
-                {/* Explanation line */}
-                <p className="text-[10px] text-slate-600 mt-1 leading-tight">
-                  Routing used estimated counts. Re-routing now requires explicit dispatcher confirmation
-                  before applying the cross-crew consensus.
-                </p>
-              </div>
-            )
-          })()}
 
           {result && (
             <div className="h-52 shrink-0 border-t border-rapid-border bg-rapid-surface overflow-x-auto overflow-y-hidden">
@@ -608,6 +608,17 @@ export default function App() {
             incidentLocation={incident}
             onClose={() => setShowDispatcher(false)}
             onRerunWithSceneData={handleRerunWithSceneData}
+          />
+        </Suspense>
+      )}
+
+      {/* WhatsApp Dispatch Simulator */}
+      {showWhatsApp && (
+        <Suspense fallback={null}>
+          <WhatsAppSimulator
+            incidentId={result?.incident_id || null}
+            assignments={result?.assignments || []}
+            onClose={() => setShowWhatsApp(false)}
           />
         </Suspense>
       )}

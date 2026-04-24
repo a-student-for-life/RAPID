@@ -48,6 +48,22 @@ export default function SDGWidget({ stats }) {
         <StatCell value={avgResponseS}          label="Avg AI"    color="text-green-400" />
       </div>
 
+      {/* Counterfactual — RAPID vs naïve closest */}
+      {stats.minutesSavedTotal !== undefined && (stats.minutesSavedTotal !== 0 || (stats.traumaSaves + stats.specialtySaves) > 0) && (
+        <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+          <StatCell
+            value={`${stats.minutesSavedTotal >= 0 ? '−' : '+'}${Math.abs(stats.minutesSavedTotal).toFixed(1)}m`}
+            label="vs Naïve"
+            color={stats.minutesSavedTotal >= 0 ? 'text-green-400' : 'text-amber-400'}
+          />
+          <StatCell
+            value={(stats.traumaSaves ?? 0) + (stats.specialtySaves ?? 0)}
+            label="Better Picks"
+            color="text-purple-400"
+          />
+        </div>
+      )}
+
       {stats.totalDispatches > 0 && (
         <p className="text-xs text-slate-600 text-center mt-1.5">
           {stats.totalDispatches} dispatch{stats.totalDispatches !== 1 ? 'es' : ''} this session

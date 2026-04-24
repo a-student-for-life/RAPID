@@ -3,6 +3,7 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, Radar,
   ResponsiveContainer, Tooltip,
 } from 'recharts'
+import CounterfactualBadge from './CounterfactualBadge.jsx'
 
 const DECISION_PATH_CONFIG = {
   groq: {
@@ -88,6 +89,9 @@ export default function AIReasoningPanel({ result, elapsed }) {
           <p className="text-sm font-bold text-slate-300">{result.scores?.length ?? 0}</p>
         </div>
       </div>
+
+      {/* Counterfactual badge — RAPID vs naïve-closest scoreboard */}
+      {result.counterfactual && <CounterfactualBadge cf={result.counterfactual} />}
 
       {/* Reasoning text */}
       {result.reasoning && (
