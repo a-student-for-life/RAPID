@@ -193,7 +193,7 @@ export default function HospitalKiosk() {
     // Use REST polling as primary — backend uses Admin SDK so Firestore security
     // rules don't block it, and it falls back to in-memory cache if Firestore is down.
     pollRest()
-    pollId = setInterval(pollRest, 3000)
+    pollId = setInterval(pollRest, 5000)
 
     return () => clearInterval(pollId)
   }, [hospitalKey, hospitalName])
