@@ -1,0 +1,10 @@
+{
+  "name": "RAPID Command",
+  "short_name": "RAPID",
+  "description": "Real-time AI Patient Incident Dispatcher",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080a0f",
+  "theme_color": "#0f172a",
+  "orientation": "portrait-primary"
+}

@@ -1,10 +1,12 @@
-import React, { Suspense, lazy } from 'react'
+import React, { Suspense, lazy, useEffect, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import 'leaflet/dist/leaflet.css'
 import './index.css'
 
 const App = lazy(() => import('./App.jsx'))
 const CrewView = lazy(() => import('./components/CrewView.jsx'))
+const HospitalKiosk = lazy(() => import('./components/HospitalKiosk.jsx'))
+const BystanderReport = lazy(() => import('./components/BystanderReport.jsx'))
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -58,7 +60,27 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-const isCrewView = window.location.hash.startsWith('#crew')
+function getHashRoute(hash) {
+  if (hash.startsWith('#report')) return 'report'
+  if (hash.startsWith('#hospital')) return 'hospital'
+  if (hash.startsWith('#crew')) return 'crew'
+  return 'app'
+}
+
+function Router() {
+  const [route, setRoute] = useState(() => getHashRoute(window.location.hash))
+
+  useEffect(() => {
+    function onHash() { setRoute(getHashRoute(window.location.hash)) }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  if (route === 'report') return <BystanderReport />
+  if (route === 'hospital') return <HospitalKiosk />
+  if (route === 'crew') return <CrewView />
+  return <App />
+}
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
@@ -72,7 +94,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <ErrorBoundary>
       <Suspense fallback={<div className="min-h-screen grid place-items-center bg-[#080a0f] text-sm text-slate-500">Loading RAPID...</div>}>
-        {isCrewView ? <CrewView /> : <App />}
+        <Router />
       </Suspense>
     </ErrorBoundary>
   </React.StrictMode>,

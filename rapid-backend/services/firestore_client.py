@@ -28,6 +28,21 @@ _ACTIVE_INCIDENT_STATUS_RANK = {
     "transporting": 4,
 }
 
+# In-memory fallback for scene assessments — works when Firestore is disabled
+_scene_cache: dict[str, list[dict[str, Any]]] = {}
+
+# In-memory fallback for kiosk prealerts — keyed by prealert_id
+_prealert_cache: dict[str, dict[str, Any]] = {}
+
+# In-memory fallback for bystander reports — keyed by report_id
+_bystander_cache: dict[str, dict[str, Any]] = {}
+
+# In-memory fallback for recent incidents — keyed by incident_id (enables pre-positioning without Firestore)
+_incident_cache: dict[str, dict[str, Any]] = {}
+
+# In-memory fallback for crew assignments — keyed by unit_id (enables pre-positioning without Firestore)
+_crew_assignment_cache: dict[str, dict[str, Any]] = {}
+
 
 def disable() -> None:
     """Proactively disable Firestore (called when Google is unreachable at startup).
@@ -131,6 +146,9 @@ async def _mutate_incident(
 
 async def save_incident(incident_id: str, data: dict[str, Any]) -> None:
     """Write an incident document to Firestore. Silent no-op on any failure."""
+    # Always cache so pre-positioning + recent-incident list work without Firestore
+    _incident_cache[incident_id] = {**data, "id": incident_id, "saved_at": data.get("saved_at") or _utc_now_iso()}
+
     def _save(doc: dict[str, Any]) -> None:
         timeline = list(doc.get("timeline", []))
         if not timeline:
@@ -171,10 +189,11 @@ async def get_incident(incident_id: str) -> dict[str, Any] | None:
 
 
 async def get_recent_incidents(limit: int = 10) -> list[dict[str, Any]]:
-    """Return the most recent incidents from Firestore, newest first."""
+    """Return the most recent incidents from Firestore, newest first. Falls back to in-memory cache."""
     db = _get_db()
     if db is None:
-        return []
+        rows = sorted(_incident_cache.values(), key=lambda d: d.get("saved_at") or "", reverse=True)
+        return rows[:limit]
     try:
         query = (
             db.collection("incidents")
@@ -186,10 +205,17 @@ async def get_recent_incidents(limit: int = 10) -> list[dict[str, Any]]:
             entry = doc.to_dict()
             entry["id"] = doc.id
             results.append(entry)
-        return results
+        # Merge in-memory cache entries not yet flushed to Firestore
+        fs_ids = {r.get("id") for r in results}
+        for r in _incident_cache.values():
+            if r.get("id") not in fs_ids:
+                results.append(r)
+        results.sort(key=lambda d: d.get("saved_at") or "", reverse=True)
+        return results[:limit]
     except Exception as exc:
         logger.warning("Firestore read failed: %s", exc)
-        return []
+        rows = sorted(_incident_cache.values(), key=lambda d: d.get("saved_at") or "", reverse=True)
+        return rows[:limit]
 
 
 # ── Crew assignments ───────────────────────────────────────────────────────────
@@ -199,25 +225,47 @@ async def save_crew_assignment(unit_id: str, data: dict[str, Any]) -> None:
     Write (overwrite) a crew assignment to crew_assignments/{unit_id}.
     The crew page subscribes to this document in real-time via Firebase JS SDK.
     """
+    doc = {
+        **data,
+        "dispatched_at": _utc_now_iso(),
+        "status":        "dispatched",
+        "updated_at":    _utc_now_iso(),
+    }
+    # Always cache so pre-positioning can read crew positions without Firestore
+    _crew_assignment_cache[unit_id] = doc
+
     db = _get_db()
     if db is None:
-        logger.warning("Firestore unavailable — crew assignment not saved for %s.", unit_id)
+        logger.warning("Firestore unavailable — crew assignment cached in-memory only for %s.", unit_id)
         return
     try:
-        doc = {
-            **data,
-            "dispatched_at": _utc_now_iso(),
-            "status":        "dispatched",
-            "updated_at":    _utc_now_iso(),
-        }
         await db.collection("crew_assignments").document(unit_id).set(doc)
         logger.info("Crew assignment saved for unit %s.", unit_id)
     except Exception as exc:
         logger.warning("Firestore crew assignment write failed for %s: %s", unit_id, exc)
 
 
+async def get_crew_assignment(unit_id: str) -> dict[str, Any] | None:
+    """Read a single crew assignment doc by unit id. Falls back to in-memory cache."""
+    db = _get_db()
+    if db is None:
+        return _crew_assignment_cache.get(unit_id)
+    try:
+        snap = await db.collection("crew_assignments").document(unit_id).get()
+        return snap.to_dict() if snap.exists else _crew_assignment_cache.get(unit_id)
+    except Exception as exc:
+        logger.warning("Firestore crew assignment read failed for %s: %s", unit_id, exc)
+        return _crew_assignment_cache.get(unit_id)
+
+
 async def update_crew_assignment(unit_id: str, patch: dict[str, Any]) -> None:
     """Merge a patch into an existing crew assignment."""
+    now = _utc_now_iso()
+    # Always update the in-memory cache so pre-positioning reads current status
+    # even when Firestore is unavailable or when the write hasn't completed yet.
+    if unit_id in _crew_assignment_cache:
+        _crew_assignment_cache[unit_id] = {**_crew_assignment_cache[unit_id], **patch, "updated_at": now}
+
     db = _get_db()
     if db is None:
         return
@@ -225,10 +273,52 @@ async def update_crew_assignment(unit_id: str, patch: dict[str, Any]) -> None:
         ref = db.collection("crew_assignments").document(unit_id)
         snap = await ref.get()
         base = snap.to_dict() if snap.exists else {}
-        await ref.set({**base, **patch, "updated_at": _utc_now_iso()})
+        await ref.set({**base, **patch, "updated_at": now})
         logger.info("Crew assignment updated for unit %s.", unit_id)
     except Exception as exc:
         logger.warning("Firestore crew assignment update failed for %s: %s", unit_id, exc)
+
+
+async def reset_all_crew_assignments(unit_ids: list[str]) -> None:
+    """Set all given crew units to standby status in memory and Firestore."""
+    now = _utc_now_iso()
+    # Always update in-memory cache so subsequent reads see standby immediately.
+    for unit_id in unit_ids:
+        _crew_assignment_cache[unit_id] = {"status": "standby", "updated_at": now}
+
+    db = _get_db()
+    if db is None:
+        return
+    for unit_id in unit_ids:
+        try:
+            await db.collection("crew_assignments").document(unit_id).set({
+                "status": "standby", "updated_at": now
+            })
+        except Exception as exc:
+            logger.warning("Firestore crew reset failed for %s: %s", unit_id, exc)
+
+
+_CREW_UNITS = ["AMB_1", "AMB_2", "AMB_3", "AMB_4", "AMB_5"]
+
+
+async def seed_crew_assignments_if_empty() -> None:
+    """
+    Idempotent startup seed: if no crew_assignment documents exist yet (e.g. after
+    a DB wipe), initialise all five units to standby so the CrewView and
+    PrepositioningPanel have something to subscribe to immediately.
+    """
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        # Peek at one doc — if any exist we don't need to seed.
+        snap = await db.collection("crew_assignments").limit(1).get()
+        if snap:
+            return
+        await reset_all_crew_assignments(_CREW_UNITS)
+        logger.info("crew_assignments seeded to standby for units: %s", _CREW_UNITS)
+    except Exception as exc:
+        logger.warning("crew_assignments seed check failed (non-fatal): %s", exc)
 
 
 async def record_incident_dispatch(incident_id: str, unit_id: str, assignment: dict[str, Any]) -> None:
@@ -311,6 +401,165 @@ async def record_hospital_prealert(
     await _mutate_incident(incident_id, _mutate)
 
 
+# ── Hospital kiosk accept/divert ───────────────────────────────────────────────
+
+async def save_kiosk_prealert(prealert_id: str, data: dict[str, Any]) -> None:
+    """
+    Write a pointer doc to `hospital_prealerts/{prealert_id}` so the hospital
+    kiosk can subscribe by hospital_id without knowing incident IDs.
+    """
+    now = _utc_now_iso()
+    doc = {**data, "status": data.get("status", "pending"), "created_at": now, "updated_at": now}
+    # Always save to in-memory cache so the REST polling fallback works without Firestore
+    _prealert_cache[prealert_id] = doc
+
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        await db.collection("hospital_prealerts").document(prealert_id).set(doc)
+        logger.info("Kiosk prealert written: %s -> %s", prealert_id, data.get("hospital_id"))
+    except Exception as exc:
+        logger.warning("Kiosk prealert write failed for %s: %s", prealert_id, exc)
+
+
+async def get_kiosk_prealerts_for_hospital(hospital_key: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return prealerts for a specific hospital, using Firestore or in-memory fallback."""
+    def _ts(p: dict) -> str:
+        return p.get("created_at") or p.get("timestamp") or ""
+
+    cache_rows = [p for p in _prealert_cache.values() if p.get("hospital_id") == hospital_key]
+
+    db = _get_db()
+    if db is None:
+        cache_rows.sort(key=_ts, reverse=True)
+        return cache_rows[:limit]
+    try:
+        # Filter by hospital_id in the query so we never miss new prealerts when
+        # the total collection size exceeds the fetch limit.
+        results = []
+        async for snap in (
+            db.collection("hospital_prealerts")
+              .where("hospital_id", "==", hospital_key)
+              .limit(limit)
+              .stream()
+        ):
+            entry = snap.to_dict()
+            entry["prealert_id"] = snap.id
+            results.append(entry)
+
+        # Merge with cache: prefer cache for status fields (cache is updated synchronously
+        # by respond_to_prealert; Firestore write may lag or fail).
+        cache_by_id = {p["prealert_id"]: p for p in cache_rows}
+        fs_ids = {r["prealert_id"] for r in results}
+        for r in results:
+            pid = r.get("prealert_id")
+            if pid in cache_by_id:
+                r.update({
+                    k: v for k, v in cache_by_id[pid].items()
+                    if k in ("status", "response_note", "responder", "responded_at", "updated_at")
+                })
+        for pid, p in cache_by_id.items():
+            if pid not in fs_ids:
+                results.append(p)
+
+        results.sort(key=_ts, reverse=True)
+        return results[:limit]
+    except Exception as exc:
+        logger.warning("Firestore kiosk prealert query failed for %s: %s", hospital_key, exc)
+        cache_rows.sort(key=_ts, reverse=True)
+        return cache_rows[:limit]
+
+
+async def get_kiosk_prealert(prealert_id: str) -> dict[str, Any] | None:
+    """Read a single kiosk prealert doc. Falls back to in-memory cache."""
+    db = _get_db()
+    if db is None:
+        return _prealert_cache.get(prealert_id)
+    try:
+        snap = await db.collection("hospital_prealerts").document(prealert_id).get()
+        if snap.exists:
+            return snap.to_dict()
+        return _prealert_cache.get(prealert_id)
+    except Exception as exc:
+        logger.warning("Kiosk prealert read failed for %s: %s", prealert_id, exc)
+        return _prealert_cache.get(prealert_id)
+
+
+async def respond_to_prealert(
+    prealert_id: str,
+    status: str,
+    note: str = "",
+    responder: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Hospital kiosk response.
+    Updates the kiosk doc and mirrors the status onto the incident's prealerts[] entry,
+    then appends a timeline event.
+    Returns the updated kiosk doc (or None if Firestore is unavailable).
+    """
+    now = _utc_now_iso()
+
+    # Update in-memory cache regardless of Firestore state
+    if prealert_id in _prealert_cache:
+        _prealert_cache[prealert_id].update({
+            "status": status, "response_note": note,
+            "responder": responder, "responded_at": now, "updated_at": now,
+        })
+
+    db = _get_db()
+    if db is None:
+        return _prealert_cache.get(prealert_id)
+    data: dict[str, Any] | None = None
+    try:
+        ref = db.collection("hospital_prealerts").document(prealert_id)
+        snap = await ref.get()
+        if snap.exists:
+            data = snap.to_dict()
+        else:
+            # Not in Firestore — use in-memory cache entry if available
+            data = dict(_prealert_cache.get(prealert_id) or {}) or None
+        if data is None:
+            return None
+        data.update({
+            "status": status,
+            "response_note": note,
+            "responder": responder,
+            "responded_at": now,
+            "updated_at": now,
+        })
+        await ref.set(data)
+    except Exception as exc:
+        logger.warning("Kiosk prealert update failed for %s: %s", prealert_id, exc)
+        return _prealert_cache.get(prealert_id)
+
+    incident_id = data.get("incident_id")
+    hospital_id = data.get("hospital_id")
+    if incident_id:
+        def _mirror(doc: dict[str, Any]) -> None:
+            prealerts = list(doc.get("prealerts", []))
+            for entry in prealerts:
+                if entry.get("prealert_id") == prealert_id:
+                    entry["status"] = status
+                    entry["response_note"] = note
+                    entry["responded_at"] = now
+                    break
+            doc["prealerts"] = prealerts[-50:]
+            _append_timeline_event(doc, {
+                "event": "hospital_response",
+                "timestamp": now,
+                "prealert_id": prealert_id,
+                "hospital_id": hospital_id,
+                "hospital_name": data.get("hospital_name"),
+                "status": status,
+                "note": note,
+            })
+
+        await _mutate_incident(incident_id, _mirror)
+
+    return data
+
+
 async def record_incident_reroute(
     incident_id: str,
     reroute: dict[str, Any],
@@ -377,18 +626,118 @@ def _init_firebase_admin() -> bool:
         return False
 
 
+# ── Bystander reports ──────────────────────────────────────────────────────────
+
+async def save_bystander_report(report_id: str, data: dict[str, Any]) -> None:
+    """Write a bystander report to Firestore and update the in-memory cache.
+    Always called with await (never create_task) so reads see it immediately."""
+    now = _utc_now_iso()
+    doc = {**data, "id": report_id, "saved_at": now, "updated_at": now}
+    _bystander_cache[report_id] = doc   # update cache first — used as fallback if Firestore unavailable
+    db = _get_db()
+    if db is None:
+        logger.warning("Firestore unavailable — bystander report %s stored in memory only.", report_id)
+        return
+    try:
+        await db.collection("bystander_reports").document(report_id).set(doc)
+        logger.info("Bystander report saved to Firestore: %s", report_id)
+    except Exception as exc:
+        logger.warning("Firestore bystander save failed for %s: %s", report_id, exc)
+
+
+async def list_bystander_reports(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """Return the most recent bystander reports, optionally filtered by status. Falls back to in-memory cache."""
+    def _from_cache() -> list[dict[str, Any]]:
+        rows = list(_bystander_cache.values())
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        rows.sort(key=lambda d: d.get("saved_at") or "", reverse=True)
+        return rows[:limit]
+
+    db = _get_db()
+    if db is None:
+        return _from_cache()
+    try:
+        fetch_limit = max(limit * 5, 100)
+        query = db.collection("bystander_reports").limit(fetch_limit)
+        results = []
+        async for snap in query.stream():
+            entry = snap.to_dict()
+            entry["id"] = snap.id
+            if not status or entry.get("status") == status:
+                results.append(entry)
+        # Merge in-memory cache entries not in Firestore
+        fs_ids = {r.get("id") for r in results}
+        for r in _bystander_cache.values():
+            if r.get("id") not in fs_ids:
+                if not status or r.get("status") == status:
+                    results.append(r)
+        results.sort(key=lambda d: d.get("saved_at") or "", reverse=True)
+        return results[:limit]
+    except Exception as exc:
+        logger.warning("Firestore bystander list failed: %s", exc)
+        return _from_cache()
+
+
+async def update_bystander_report(report_id: str, patch: dict[str, Any]) -> bool:
+    """Patch a bystander report doc. Updates in-memory cache; Firestore is best-effort."""
+    if report_id in _bystander_cache:
+        _bystander_cache[report_id].update({**patch, "updated_at": _utc_now_iso()})
+
+    db = _get_db()
+    if db is None:
+        return report_id in _bystander_cache
+    try:
+        ref = db.collection("bystander_reports").document(report_id)
+        snap = await ref.get()
+        if snap.exists:
+            base = snap.to_dict() or {}
+            await ref.set({**base, **patch, "updated_at": _utc_now_iso()})
+        elif report_id in _bystander_cache:
+            await ref.set({**_bystander_cache[report_id], **patch, "updated_at": _utc_now_iso()})
+        else:
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("Firestore bystander update failed for %s: %s", report_id, exc)
+        return report_id in _bystander_cache
+
+
+async def dismiss_all_bystander_reports(reason: str = "session_ended") -> int:
+    """Dismiss all 'new' bystander reports. Returns count dismissed."""
+    now = _utc_now_iso()
+    count = 0
+    for doc in _bystander_cache.values():
+        if doc.get("status") == "new":
+            doc.update({"status": "dismissed", "dismiss_reason": reason, "updated_at": now})
+            count += 1
+
+    db = _get_db()
+    if db is None:
+        return count
+    try:
+        dismissed = 0
+        async for snap in db.collection("bystander_reports").where("status", "==", "new").stream():
+            base = snap.to_dict() or {}
+            await snap.reference.set({**base, "status": "dismissed", "dismiss_reason": reason, "updated_at": now})
+            dismissed += 1
+        return dismissed
+    except Exception as exc:
+        logger.warning("dismiss_all_bystander_reports failed: %s", exc)
+        return count
+
+
 async def save_scene_assessment(incident_id: str, unit_id: str, data: dict[str, Any]) -> None:
-    """Save a scene assessment report to scene_assessments/{incident_id}/reports/{unit_id}."""
+    """Write a scene assessment to Firestore and update the in-memory cache.
+    Always called with await (never create_task) so subsequent reads see it immediately."""
+    doc = {**data, "unit_id": unit_id, "incident_id": incident_id, "saved_at": _utc_now_iso()}
+    cache = _scene_cache.setdefault(incident_id, [])
+    _scene_cache[incident_id] = [r for r in cache if r.get("unit_id") != unit_id] + [doc]
+
     db = _get_db()
     if db is None:
         return
     try:
-        doc = {
-            **data,
-            "unit_id":     unit_id,
-            "incident_id": incident_id,
-            "saved_at":    _utc_now_iso(),
-        }
         await (
             db.collection("scene_assessments")
               .document(incident_id)
@@ -402,10 +751,10 @@ async def save_scene_assessment(incident_id: str, unit_id: str, data: dict[str, 
 
 
 async def get_scene_assessments(incident_id: str) -> list[dict[str, Any]]:
-    """Return all scene assessment reports for an incident. Empty list if unavailable."""
+    """Return all scene assessment reports for an incident. Falls back to in-memory cache."""
     db = _get_db()
     if db is None:
-        return []
+        return list(_scene_cache.get(incident_id, []))
     try:
         results = []
         async for doc in (
@@ -417,10 +766,16 @@ async def get_scene_assessments(incident_id: str) -> list[dict[str, Any]]:
             entry = doc.to_dict()
             entry["id"] = doc.id
             results.append(entry)
+        # Merge with in-memory cache to include any reports saved since last Firestore write
+        cached = _scene_cache.get(incident_id, [])
+        fs_ids = {r.get("unit_id") for r in results}
+        for r in cached:
+            if r.get("unit_id") not in fs_ids:
+                results.append(r)
         return results
     except Exception as exc:
         logger.warning("Firestore get_scene_assessments failed: %s", exc)
-        return []
+        return list(_scene_cache.get(incident_id, []))
 
 
 async def send_crew_fcm(fcm_token: str, title: str, body: str) -> None:

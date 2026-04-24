@@ -8,7 +8,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import incident, transcribe, crew
+from routers import bystander, crew, incident, prepositioning, transcribe
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,6 +80,12 @@ async def lifespan(app: FastAPI):
     if os.getenv("GOOGLE_CLOUD_PROJECT"):
         if await _check_google_reachable():
             logger.info("Google connectivity OK — Firestore enabled.")
+            # Seed crew_assignments on startup (no-op if docs already exist).
+            try:
+                from services import firestore_client as _fc
+                await _fc.seed_crew_assignments_if_empty()
+            except Exception as _seed_exc:
+                logger.warning("Startup crew seed failed (non-fatal): %s", _seed_exc)
         else:
             logger.warning(
                 "Cannot reach oauth2.googleapis.com — Firestore disabled. "
@@ -109,6 +115,8 @@ app.add_middleware(
 app.include_router(incident.router,   prefix="/api")
 app.include_router(transcribe.router, prefix="/api")
 app.include_router(crew.router,       prefix="/api")
+app.include_router(bystander.router,  prefix="/api")
+app.include_router(prepositioning.router, prefix="/api")
 
 
 @app.get("/health")

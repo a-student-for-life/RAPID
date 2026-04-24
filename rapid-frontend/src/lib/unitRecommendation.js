@@ -29,7 +29,7 @@ export function recommendUnitForAssignment(assignment, unitDocs = {}) {
     .sort((left, right) => right.score - left.score || left.unitId.localeCompare(right.unitId))
 
   if (!candidates.length) {
-    return { unitId: 'AMB_1', reason: 'All units are currently active - defaulting to ALPHA-1.' }
+    return { unitId: 'AMB_1', reason: 'No standby units found — check unit statuses or use RESET UNITS if data is stale.' }
   }
 
   const best = candidates[0]

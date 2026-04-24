@@ -19,11 +19,11 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
-from pydantic import Field
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from models.schemas import IncidentRequest, IncidentResponse
-from services import fallback_router, firestore_client, gemini_router, groq_router
+from services import counterfactual, fallback_router, firestore_client, gemini_router, groq_router, image_store
 from services.aggregator import fetch_hospital_data
 from services.location_engine import discover_agencies, discover_hospitals_adaptive
 from services.quota_tracker import quota_tracker
@@ -63,6 +63,16 @@ async def list_incidents(limit: int = 10):
     return {"incidents": incidents, "count": len(incidents)}
 
 
+@router.get("/counterfactual/session")
+async def counterfactual_session(limit: int = 50):
+    """
+    Aggregate counterfactual results across recent incidents.
+    Powers the 'minutes saved this session' SDG tile and judge-demo scoreboard.
+    """
+    incidents = await firestore_client.get_recent_incidents(limit=min(max(1, limit), 200))
+    return counterfactual.aggregate_session(incidents)
+
+
 @router.get("/system-status")
 async def system_status():
     """
@@ -97,6 +107,7 @@ async def scene_assess(
         raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
 
     mime_type = image.content_type or "image/jpeg"
+    scene_image_id = image_store.save(raw, mime_type)
     data_url = f"data:{mime_type};base64,{base64.b64encode(raw).decode()}"
 
     prompt = (
@@ -149,19 +160,16 @@ async def scene_assess(
                 cleaned = re.sub(r"```.*?\n|```", "", raw_text, flags=re.DOTALL).strip()
                 result = jsonlib.loads(cleaned)
                 result["_model"] = model
+                result["image_id"] = scene_image_id
 
                 if incident_id and unit_id:
-                    asyncio.create_task(
-                        firestore_client.save_scene_assessment(incident_id, unit_id, {**result})
-                    )
+                    await firestore_client.save_scene_assessment(incident_id, unit_id, {**result})
 
                 aggregated = None
                 if incident_id:
                     try:
                         existing = await firestore_client.get_scene_assessments(incident_id)
-                        this_report = {**result, "unit_id": unit_id or "unknown"}
-                        all_reports = [r for r in existing if r.get("unit_id") != unit_id] + [this_report]
-                        aggregated = build_scene_consensus(all_reports)
+                        aggregated = build_scene_consensus(existing)
                     except Exception as agg_exc:
                         logger.warning("Scene aggregation failed: %s", agg_exc)
 
@@ -188,6 +196,74 @@ async def get_scene_assessments_endpoint(incident_id: str):
     reports = await firestore_client.get_scene_assessments(incident_id)
     aggregated = build_scene_consensus(reports)
     return {"incident_id": incident_id, "aggregated": aggregated, "raw_reports": aggregated["raw_reports"]}
+
+
+@router.get("/images/{image_id}")
+async def serve_image(image_id: str):
+    """Serve a stored scene or bystander image by its image_id."""
+    item = image_store.get(image_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Image not found.")
+    data, mime = item
+    return Response(content=data, media_type=mime)
+
+
+@router.get("/scene-intel/{incident_id}")
+async def get_scene_intel(incident_id: str):
+    """
+    Unified scene intelligence endpoint for the SceneIntelPanel.
+    Returns crew reports (from scene_assessments subcollection) + new bystander
+    reports submitted within the last 4 hours (stale reports from prior sessions
+    are excluded).  report_count = crew + pending bystander total.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    crew_reports, all_bystander = await asyncio.gather(
+        firestore_client.get_scene_assessments(incident_id),
+        firestore_client.list_bystander_reports(status="new", limit=50),
+    )
+    # Drop reports older than 4 hours — prevents last session's data from reappearing
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+    bystander_reports = [r for r in all_bystander if (r.get("saved_at") or "") >= cutoff]
+
+    aggregated = build_scene_consensus(crew_reports)
+    total_count = len(crew_reports) + len(bystander_reports)
+    return {
+        "incident_id":       incident_id,
+        "crew_reports":      crew_reports,
+        "bystander_reports": bystander_reports,
+        "aggregated": {
+            **aggregated,
+            "report_count": total_count,
+        },
+    }
+
+
+class SceneInjectRequest(BaseModel):
+    report_id: Optional[str] = None
+    triage: dict
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    image_id: Optional[str] = None
+
+
+@router.post("/scene-assessments/{incident_id}/inject")
+async def inject_bystander_scene(incident_id: str, payload: SceneInjectRequest):
+    """
+    Inject bystander triage data into scene assessments for an active incident.
+    Enables the dispatcher to pull bystander reports into the scene intel consensus
+    and trigger the RERUN WITH SCENE DATA flow.
+    """
+    unit_id = f"bystander_{(payload.report_id or uuid.uuid4().hex)[:12]}"
+    data = {**payload.triage, "source": "bystander"}
+    if payload.image_id:
+        data["image_id"] = payload.image_id
+    await firestore_client.save_scene_assessment(incident_id, unit_id, data)
+
+    reports = await firestore_client.get_scene_assessments(incident_id)
+    aggregated = build_scene_consensus(reports)
+    logger.info("Bystander triage injected into scene intel: incident=%s unit=%s", incident_id, unit_id)
+    return {"status": "injected", "incident_id": incident_id, "unit_id": unit_id, "aggregated": aggregated}
 
 
 @router.post("/incidents/{incident_id}/reroute", response_model=IncidentResponse)
@@ -307,6 +383,7 @@ async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
             })
 
             enriched_hospitals = _enrich_hospitals(hospitals, hospital_data)
+            cf = _safe_counterfactual(routing["assignments"], scores, patient_groups, hospital_data)
             response_obj = _build_incident_response(
                 incident_id=incident_id,
                 routing=routing,
@@ -314,6 +391,7 @@ async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
                 scores=scores,
                 agencies=agencies,
                 elapsed=elapsed,
+                cf=cf,
             )
             incident_doc = _build_incident_document(
                 payload=payload,
@@ -322,6 +400,7 @@ async def stream_incident(payload: IncidentRequest) -> StreamingResponse:
                 elapsed=elapsed,
                 enriched_hospitals=enriched_hospitals,
                 scores=scores,
+                cf=cf,
             )
 
             asyncio.create_task(firestore_client.save_incident(incident_id, incident_doc))
@@ -376,6 +455,7 @@ async def _execute_incident(
     )
 
     enriched_hospitals = _enrich_hospitals(hospitals, hospital_data)
+    cf = _safe_counterfactual(routing["assignments"], scores, patient_groups, hospital_data)
     response = _build_incident_response(
         incident_id=incident_id,
         routing=routing,
@@ -383,6 +463,7 @@ async def _execute_incident(
         scores=scores,
         agencies=agencies,
         elapsed=elapsed,
+        cf=cf,
     )
     incident_doc = _build_incident_document(
         payload=payload,
@@ -391,8 +472,23 @@ async def _execute_incident(
         elapsed=elapsed,
         enriched_hospitals=enriched_hospitals,
         scores=scores,
+        cf=cf,
     )
     return response, incident_doc
+
+
+def _safe_counterfactual(
+    rapid_assignments: list[dict],
+    scores: list[dict],
+    patient_groups: list[dict],
+    hospital_data: dict[str, dict],
+) -> Optional[dict]:
+    """Compute counterfactual scoreboard; never break the response if math fails."""
+    try:
+        return counterfactual.compute(rapid_assignments, scores, patient_groups, hospital_data)
+    except Exception as exc:
+        logger.warning("Counterfactual compute failed: %s", exc)
+        return None
 
 
 def _enrich_hospitals(hospitals: list[dict], hospital_data: dict[str, dict]) -> list[dict]:
@@ -428,6 +524,7 @@ def _build_incident_response(
     scores: list[dict],
     agencies: list[dict],
     elapsed: float,
+    cf: Optional[dict] = None,
 ) -> IncidentResponse:
     return IncidentResponse(
         incident_id=incident_id,
@@ -440,6 +537,7 @@ def _build_incident_response(
         reasoning=routing.get("reasoning", ""),
         elapsed_s=elapsed,
         agencies=agencies,
+        counterfactual=cf,
     )
 
 
@@ -451,6 +549,7 @@ def _build_incident_document(
     elapsed: float,
     enriched_hospitals: list[dict],
     scores: list[dict],
+    cf: Optional[dict] = None,
 ) -> dict:
     return {
         "lat": payload.lat,
@@ -465,6 +564,7 @@ def _build_incident_document(
         "hospitals": enriched_hospitals,
         "scores": scores,
         "status": "new",
+        "counterfactual": cf,
     }
 
 
