@@ -162,7 +162,7 @@ export default function SceneIntelPanel({ incidentId, incidentLocation, onRerun 
     }
 
     poll()
-    const id = setInterval(poll, 3000)
+    const id = setInterval(poll, 8000)
     return () => { cancelled = true; clearInterval(id) }
   }, [incidentId, refreshTick])
 

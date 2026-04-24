@@ -25,6 +25,9 @@ rapid-e8121-4930ce74cf19*.json
 rapidtts-e8121-9ab23690a133*.json
 
 
+# Uploaded images (disk-backed image store — never commit user data)
+rapid-backend/uploads/
+
 # Misc
 *.log
 .DS_Store

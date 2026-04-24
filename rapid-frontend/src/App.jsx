@@ -95,7 +95,7 @@ export default function App() {
       } catch {}
     }
     poll()
-    const interval = setInterval(poll, 3000)
+    const interval = setInterval(poll, 12000)
     return () => clearInterval(interval)
   }, [result?.incident_id])
 
