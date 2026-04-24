@@ -1,7 +1,30 @@
 import React, { Suspense, lazy, useEffect, useState } from 'react'
 import ReactDOM from 'react-dom/client'
+import axios from 'axios'
 import 'leaflet/dist/leaflet.css'
 import './index.css'
+
+// ── Remote API base ───────────────────────────────────────────────────────
+// In dev, Vite proxies /api to localhost:8000. In prod (Firebase / Cloud Run
+// frontend / wherever we host the static bundle), VITE_API_URL points at the
+// Cloud Run backend. We transparently rewrite relative /api/* calls so no
+// component needs to know the backend is on a different origin.
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '')
+if (API_BASE) {
+  axios.defaults.baseURL = API_BASE
+
+  const _fetch = window.fetch.bind(window)
+  window.fetch = (input, init) => {
+    if (typeof input === 'string' && input.startsWith('/api/')) {
+      return _fetch(API_BASE + input, init)
+    }
+    if (input instanceof Request && input.url.startsWith(`${window.location.origin}/api/`)) {
+      const rewritten = new Request(API_BASE + input.url.slice(window.location.origin.length), input)
+      return _fetch(rewritten, init)
+    }
+    return _fetch(input, init)
+  }
+}
 
 const App = lazy(() => import('./App.jsx'))
 const CrewView = lazy(() => import('./components/CrewView.jsx'))
