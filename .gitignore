@@ -37,6 +37,6 @@ docs/
 tools/
 prompts/
 .claude/
-.codex_tmp/pptxlib/
+.codex_tmp/
 .sixth/
 .conda/
