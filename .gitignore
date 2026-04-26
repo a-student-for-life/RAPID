@@ -31,3 +31,12 @@ rapid-backend/uploads/
 # Misc
 *.log
 .DS_Store
+
+# Ignore specific folders
+docs/
+tools/
+prompts/
+.claude/
+.codex_tmp/pptxlib/
+.sixth/
+.conda/
