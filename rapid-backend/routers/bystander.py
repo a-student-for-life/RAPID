@@ -36,7 +36,7 @@ router = APIRouter()
 ReportStatus = Literal["new", "promoted", "dismissed"]
 
 VISION_MODELS = [
-    "llama-3.2-90b-vision-preview",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
 
 VISION_PROMPT = (
