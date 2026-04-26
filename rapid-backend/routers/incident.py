@@ -129,7 +129,7 @@ async def scene_assess(
     )
 
     models = [
-        "llama-3.2-11b-vision-preview",
+        "llama-3.2-90b-vision-preview",
     ]
 
     body = {
