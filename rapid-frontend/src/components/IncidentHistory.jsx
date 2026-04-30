@@ -3,7 +3,17 @@ import axios from 'axios'
 
 const PATH_COLORS = {
   AI:       'text-green-400',
+  groq:     'text-blue-400',
+  gemini:   'text-blue-400',
   FALLBACK: 'text-amber-400',
+}
+
+const PATH_LABELS = {
+  AI:       'Gemini AI',
+  groq:     'Gemini AI',
+  gemini:   'Gemini AI',
+  FALLBACK: 'Fallback',
+  fallback: 'Fallback',
 }
 
 export default function IncidentHistory({ refreshKey, onReplay }) {
@@ -37,6 +47,7 @@ export default function IncidentHistory({ refreshKey, onReplay }) {
       {incidents.map(inc => {
         const ts  = inc.saved_at ? new Date(inc.saved_at).toLocaleTimeString() : '—'
         const cls = PATH_COLORS[inc.decision_path] || 'text-slate-400'
+        const label = PATH_LABELS[inc.decision_path] || inc.decision_path
         return (
           <button
             key={inc.id}
@@ -44,7 +55,7 @@ export default function IncidentHistory({ refreshKey, onReplay }) {
             className="w-full text-left px-2.5 py-2 rounded border border-rapid-border bg-rapid-bg hover:border-blue-700 transition-colors group"
           >
             <div className="flex items-center justify-between">
-              <span className={`text-xs font-bold ${cls}`}>{inc.decision_path}</span>
+              <span className={`text-xs font-bold ${cls}`}>{label}</span>
               <span className="text-xs text-slate-600">{ts}</span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">

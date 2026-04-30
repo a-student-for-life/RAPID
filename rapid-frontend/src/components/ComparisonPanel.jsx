@@ -95,9 +95,9 @@ function TermExplainer() {
       {open && (
         <div className="mt-2 rounded-xl border border-slate-600 bg-slate-800 px-4 py-3 text-xs text-slate-300 space-y-2 max-w-3xl">
           <div>
-            <span className="text-green-400 font-black">Groq AI (Primary)</span>
+            <span className="text-blue-400 font-black">Gemini AI (Primary)</span>
             {' — '}
-            RAPID's main brain. An LLM running on Groq reads the full incident — patient severities, hospital capacities,
+            RAPID's main brain. Gemini reads the full incident — patient severities, hospital capacities,
             trauma capability, blood readiness — and writes reasoned assignments the way an experienced dispatcher would.
             It can spread patients across hospitals and explain every decision.
           </div>
@@ -316,7 +316,7 @@ export default function ComparisonPanel({ aiResult, fallbackResult, fallbackLoad
       {/* Columns */}
       <div className="flex gap-4 flex-1 overflow-hidden min-h-0">
         <ComparisonColumn
-          label="Groq AI (Primary)"
+          label="Gemini AI (Primary)"
           result={aiResult}
           loading={false}
           color="green"

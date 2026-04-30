@@ -17,6 +17,8 @@ L.Icon.Default.mergeOptions({
 })
 
 const GMAPS_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || ''
+const MAP_PROVIDER = String(import.meta.env.VITE_MAP_PROVIDER || 'leaflet').toLowerCase()
+const USE_GOOGLE_MAPS = MAP_PROVIDER === 'google' && Boolean(GMAPS_KEY)
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -588,7 +590,7 @@ export default function RapidMap({ incident, result, onLocationSelect }) {
     onLocationSelect,
   }
 
-  const inner = GMAPS_KEY ? (
+  const inner = USE_GOOGLE_MAPS ? (
     <APIProvider apiKey={GMAPS_KEY} libraries={['marker']}>
       <GmapsMapView {...sharedProps} />
     </APIProvider>

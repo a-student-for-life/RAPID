@@ -15,6 +15,10 @@ import { DEMO_SCENARIO } from './demoScenario.js'
 import { AUTO_DEMO_ENABLED } from './lib/appConfig.js'
 import { getConsensusPatientGroups } from './lib/sceneIntel.js'
 
+const FRONTEND_MAP_PROVIDER = String(import.meta.env.VITE_MAP_PROVIDER || 'leaflet').toLowerCase()
+const FRONTEND_GMAPS_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || ''
+const FRONTEND_USES_GOOGLE_MAP = FRONTEND_MAP_PROVIDER === 'google' && Boolean(FRONTEND_GMAPS_KEY)
+
 const RapidMap = lazy(() => import('./components/Map.jsx'))
 const DispatcherPanel = lazy(() => import('./components/DispatcherPanel.jsx'))
 const ComparisonPanel = lazy(() => import('./components/ComparisonPanel.jsx'))
@@ -452,6 +456,9 @@ export default function App() {
       })()
     : false
   const showMCI = isMCI || preMCI
+  const effectiveMapProvider = FRONTEND_USES_GOOGLE_MAP && systemStatus?.map_provider === 'google'
+    ? 'google'
+    : 'oss'
 
   return (
     <div className="flex flex-col h-screen bg-rapid-bg text-slate-200 overflow-hidden">
@@ -473,11 +480,11 @@ export default function App() {
           {/* Provider status pill */}
           {systemStatus && (
             <span className={`text-xs px-2 py-0.5 rounded-full border font-mono hidden sm:inline ${
-              systemStatus.map_provider === 'google'
+              effectiveMapProvider === 'google'
                 ? 'text-green-400 border-green-800 bg-green-950/30'
                 : 'text-slate-400 border-slate-700 bg-slate-900/30'
             }`}>
-              {systemStatus.map_provider === 'google' ? '● Google APIs' : '● OSS Mode'}
+              {effectiveMapProvider === 'google' ? '● Google APIs' : '● OSS Mode'}
             </span>
           )}
 
@@ -485,12 +492,12 @@ export default function App() {
             <div className="flex items-center gap-2 text-xs">
               <span className={`px-2 py-0.5 rounded-full font-semibold ${
                 result.decision_path === 'groq'
-                  ? 'bg-green-900/50 text-green-300 border border-green-700'
+                  ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
                   : result.decision_path === 'gemini' || result.decision_path === 'AI'
                   ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
                   : 'bg-amber-900/50 text-amber-300 border border-amber-700'
               }`}>
-                {result.decision_path === 'groq'   ? '✦ Groq AI'
+                {result.decision_path === 'groq'   ? '✦ Gemini AI'
                  : result.decision_path === 'gemini' || result.decision_path === 'AI' ? '✦ Gemini AI'
                  : '⚡ Fallback'}
               </span>

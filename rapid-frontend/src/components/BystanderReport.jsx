@@ -6,7 +6,7 @@ import axios from 'axios'
  *
  * Hash route: #report
  * Mobile-first form: capture a photo, auto-geolocate, submit.
- * Backend runs Gemini/Groq vision to estimate casualties and hazards, writes
+ * Backend runs Gemini vision to estimate casualties and hazards, writes
  * to Firestore `bystander_reports` where the dispatcher inbox picks it up.
  */
 

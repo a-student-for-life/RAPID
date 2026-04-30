@@ -7,29 +7,29 @@ import CounterfactualBadge from './CounterfactualBadge.jsx'
 
 const DECISION_PATH_CONFIG = {
   groq: {
-    label: 'Groq AI (Llama-3.3)',
-    color: 'text-green-400',
-    border: 'border-green-600',
-    bg: 'bg-green-950/30',
-    icon: '✦',
-    sub: 'Primary AI — Llama-3.3-70b clinical reasoning',
-  },
-  gemini: {
-    label: 'Gemini AI (Fallback)',
+    label: 'Gemini AI',
     color: 'text-blue-400',
     border: 'border-blue-600',
     bg: 'bg-blue-950/30',
     icon: '✦',
-    sub: 'AI fallback — Gemini 2.0 Flash routing',
+    sub: 'Primary AI - Gemini clinical reasoning',
   },
-  // legacy "AI" path — treat as Groq (primary)
-  AI: {
-    label: 'AI Routing',
-    color: 'text-green-400',
-    border: 'border-green-600',
-    bg: 'bg-green-950/30',
+  gemini: {
+    label: 'Gemini AI',
+    color: 'text-blue-400',
+    border: 'border-blue-600',
+    bg: 'bg-blue-950/30',
     icon: '✦',
-    sub: 'AI clinical reasoning',
+    sub: 'Google AI - Gemini 2.0 Flash routing',
+  },
+  // legacy "AI" path
+  AI: {
+    label: 'Gemini AI',
+    color: 'text-blue-400',
+    border: 'border-blue-600',
+    bg: 'bg-blue-950/30',
+    icon: '✦',
+    sub: 'Google AI clinical reasoning',
   },
   FALLBACK: {
     label: 'Deterministic Fallback',
