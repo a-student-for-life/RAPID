@@ -20,6 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # account JSON, __pycache__, tests) out of the image.
 COPY . .
 
+# Groq's current hosted Vision model. Keep this build-time compatibility shim
+# so stale source references cannot break a deployment while the source is migrated.
+RUN sed -i 's#meta-llama/llama-4-scout-17b-16e-instruct#qwen/qwen3.6-27b#g' routers/incident.py
+
 # Cloud Run injects PORT at runtime (defaults to 8080). Use shell form so
 # $PORT expands — the exec form would treat it as a literal string.
 ENV PORT=8080
