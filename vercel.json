@@ -1,0 +1,6 @@
+{
+  "framework": "vite",
+  "installCommand": "cd rapid-frontend && npm install",
+  "buildCommand": "cd rapid-frontend && npm run build",
+  "outputDirectory": "rapid-frontend/dist"
+}
