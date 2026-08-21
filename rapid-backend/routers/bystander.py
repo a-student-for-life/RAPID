@@ -10,7 +10,7 @@ GET  /bystander/reports           - dispatcher inbox (status filter)
 POST /bystander/reports/{id}/promote  - promote to a full incident
 POST /bystander/reports/{id}/dismiss  - mark as dismissed
 
-The vision call reuses the same Groq Llama-4-scout prompt as /scene-assess so
+The vision call reuses the same Groq Qwen 3.6 Vision path as /scene-assess so
 both signals populate patient_groups in a consistent shape.
 """
 
@@ -36,7 +36,7 @@ router = APIRouter()
 ReportStatus = Literal["new", "promoted", "dismissed"]
 
 VISION_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.6-27b",
 ]
 
 VISION_PROMPT = (
@@ -101,17 +101,13 @@ async def _run_vision(data_url: str) -> dict:
 
 @router.post("/bystander/report")
 async def submit_bystander_report(
-    image:   UploadFile = File(...),
-    lat:     float      = Form(...),
-    lon:     float      = Form(...),
+    image: UploadFile = File(...),
+    lat: float = Form(...),
+    lon: float = Form(...),
     contact: Optional[str] = Form(None),
-    notes:   Optional[str] = Form(None),
+    notes: Optional[str] = Form(None),
 ):
-    """
-    Public submission endpoint. No auth — the dispatcher decides whether a
-    report is real. Runs vision triage synchronously so the bystander gets
-    instant feedback.
-    """
+    """Public submission endpoint with synchronous vision triage."""
     raw = await image.read()
     if len(raw) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image too large (max 10 MB).")
@@ -124,15 +120,15 @@ async def submit_bystander_report(
 
     report_id = str(uuid.uuid4())
     doc = {
-        "report_id":  report_id,
-        "lat":        lat,
-        "lon":        lon,
-        "contact":    (contact or "").strip() or None,
-        "notes":      (notes or "").strip() or None,
-        "triage":     triage,
-        "image_id":   image_id,
-        "status":     "new",
-        "source":     "bystander_web",
+        "report_id": report_id,
+        "lat": lat,
+        "lon": lon,
+        "contact": (contact or "").strip() or None,
+        "notes": (notes or "").strip() or None,
+        "triage": triage,
+        "image_id": image_id,
+        "status": "new",
+        "source": "bystander_web",
     }
 
     await firestore_client.save_bystander_report(report_id, doc)
@@ -148,7 +144,7 @@ async def submit_bystander_report(
 
 @router.get("/bystander/reports")
 async def list_bystander_reports(status: str = "new", limit: int = 20):
-    """Dispatcher-side inbox. Filters by status (new | promoted | dismissed)."""
+    """Dispatcher-side inbox. Filters by status."""
     reports = await firestore_client.list_bystander_reports(
         status=status if status in {"new", "promoted", "dismissed"} else None,
         limit=min(max(1, limit), 100),
@@ -158,7 +154,7 @@ async def list_bystander_reports(status: str = "new", limit: int = 20):
 
 @router.post("/bystander/reports/dismiss-all")
 async def dismiss_all_reports(reason: str = "session_ended"):
-    """Dismiss all pending 'new' bystander reports. Called when a dispatcher session ends."""
+    """Dismiss all pending new bystander reports."""
     count = await firestore_client.dismiss_all_bystander_reports(reason)
     return {"dismissed": count, "reason": reason}
 
@@ -169,9 +165,9 @@ class BystanderPromoteRequest(BaseModel):
 
 @router.post("/bystander/reports/{report_id}/promote")
 async def promote_bystander_report(report_id: str, payload: BystanderPromoteRequest):
-    """Mark a report as promoted. Caller is expected to have created an incident."""
+    """Mark a report as promoted."""
     ok = await firestore_client.update_bystander_report(report_id, {
-        "status":      "promoted",
+        "status": "promoted",
         "incident_id": payload.incident_id,
     })
     if not ok:
@@ -183,8 +179,8 @@ async def promote_bystander_report(report_id: str, payload: BystanderPromoteRequ
 async def dismiss_bystander_report(report_id: str, reason: str = ""):
     """Dismiss a bystander report as noise or duplicate."""
     ok = await firestore_client.update_bystander_report(report_id, {
-        "status":           "dismissed",
-        "dismiss_reason":   reason,
+        "status": "dismissed",
+        "dismiss_reason": reason,
     })
     if not ok:
         raise HTTPException(status_code=404, detail="Report not found or Firestore unavailable.")
